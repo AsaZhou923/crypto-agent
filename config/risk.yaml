@@ -1,0 +1,19 @@
+# Required limits deliberately unset. Supply your own paper experiment limits,
+# or select --config config/demo for explicitly labelled test parameters.
+allow_leverage: false
+allow_short: false
+allowed_symbols: [BTC/USD]
+price_bounds_usd: null
+require_order_preview: true
+max_position_pct: null
+max_total_position_pct: null
+max_order_notional_usd: null
+min_order_notional_usd: null
+max_daily_loss_usd: null
+max_data_age_seconds: null
+max_decision_age_seconds: null
+fee_buffer_bps: null
+slippage_bps: null
+max_spread_bps: null
+min_price_usd: null
+max_price_usd: null

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crypto-agent"
+version = "0.3.1"
+description = "Three-symbol crypto spot paper trading with bounded automation and evaluation"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = ["httpx>=0.28,<0.29", "PyYAML>=6,<7", "python-dotenv>=1,<2"]
+
+[project.optional-dependencies]
+dashboard = ["fastapi==0.135.1", "uvicorn==0.41.0"]
+ai = ["tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@2d17df8da1536c121e4d7395ac5a5dcec9e96d6f"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.15,<0.16"]
+
+[project.scripts]
+crypto-agent = "crypto_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]

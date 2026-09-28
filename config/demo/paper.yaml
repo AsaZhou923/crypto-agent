@@ -1,0 +1,12 @@
+# Local Alpaca Paper only. External submission remains disabled by default.
+environment: paper
+broker: alpaca_paper
+base_url: https://paper-api.alpaca.markets
+trading_enabled: false
+symbols: [BTC/USD]
+trigger: manual
+# Offline automation can be tested with scheduled and --execute-offline.
+database_path: runtime/demo.sqlite
+request_timeout_seconds: 15
+market_data_source: alpaca_crypto_us_orderbook
+fresh_market_wait_seconds: 0

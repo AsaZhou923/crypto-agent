@@ -1,0 +1,19 @@
+# SYNTHETIC DEMONSTRATION PARAMETERS. Not investment advice.
+allow_leverage: false
+allow_short: false
+allowed_symbols: [BTC/USD]
+price_bounds_usd:
+  BTC/USD: {min: 100, max: 1000000}
+require_order_preview: true
+max_position_pct: 0.20
+max_total_position_pct: 0.20
+max_order_notional_usd: 1500
+min_order_notional_usd: 1
+max_daily_loss_usd: 100
+max_data_age_seconds: 60
+max_decision_age_seconds: 300
+fee_buffer_bps: 30
+slippage_bps: 20
+max_spread_bps: 100
+min_price_usd: 100
+max_price_usd: 1000000

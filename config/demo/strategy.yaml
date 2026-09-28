@@ -1,0 +1,19 @@
+name: baseline
+upstream_repository: ../TradingAgents
+upstream_commit: 2d17df8da1536c121e4d7395ac5a5dcec9e96d6f
+analysis_symbol: BTC-USD
+asset_type: crypto
+llm_provider: null
+deep_think_llm: null
+quick_think_llm: null
+selected_analysts: [market]
+max_debate_rounds: 1
+max_risk_discuss_rounds: 1
+output_language: Chinese
+decision_profile: balanced
+timeout_seconds: 180
+decision_ttl_seconds: 300
+# Illustrative sizing only. Hold retains the actual existing position.
+rating_target_pct: {Buy: 0.10, Overweight: 0.05, Underweight: 0.02, Sell: 0}
+baseline_buy_below_usd: 60000
+baseline_target_pct: 0.10

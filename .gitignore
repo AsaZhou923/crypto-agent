@@ -1,0 +1,21 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.DS_Store
+runtime/*
+!runtime/.gitkeep
+
+# Local dashboard dependencies and browser verification
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+output/
+.playwright-cli/
