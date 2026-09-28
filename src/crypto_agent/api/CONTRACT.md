@@ -29,6 +29,12 @@ Equity merges account-matched SQLite history with actual successful Paper accoun
 
 ## Fixed local scheduler control
 
+Linux deployment also supports the fixed user units `crypto-agent-paper.timer` and `.service`, with exact installed unit validation, no drop-ins, and a loaded-config freshness check. Linux stop persists the pause marker before disabling the timer and stopping the active service. Start never directly launches a tick; each completed invocation is followed by a 300-second delay. macOS retains launchd behavior.
+
+The API always binds loopback. An explicit `--external-origin https://<host>.ts.net:<port>` permits that exact external Host/Origin behind Tailscale Serve; no wildcard is accepted. Control requests must match that origin exactly and include the control header. The network authorization boundary is Tailscale Serve and the existing tailnet ACL.
+
+`GET /api/health/scheduler` returns `{status:"ok"|"degraded",reason,last_started_at?,last_checked_at?}` with HTTP 200/503. Health includes the enabled state, active timer, approval checks, unknown submissions and scheduler heartbeat freshness (1,260 seconds). Read-only checks do not refresh the heartbeat; valid broker retry cooldowns do not suppress scheduler check heartbeats.
+
 - `GET /api/scheduler`: `{available,enabled,loaded,running,can_start,can_stop,state,reason,interval_seconds,symbols,as_of,error}`. Polling reads actual launchd state and SQLite through a read-only connection. `enabled` is the trading authorization after the pause marker; `loaded` and `running` separately describe launchd.
 - `POST /api/scheduler`: JSON `{action:"start"|"stop"}`, no extra fields. Requires exact same-origin `Origin` and `X-Crypto-Agent-Control: 1`. No arbitrary command, path, label, symbol or mode accepted. Other mutations remain HTTP 405. Demo and other project configurations cannot control the fixed Paper task.
 - Start is bounded and does not run a tick or kickstart. Stop persists the pause marker before unloading launchd; accepted platform orders are not canceled. Failures return safe HTTP 409/503 detail, and the UI reads status again without retrying the write.

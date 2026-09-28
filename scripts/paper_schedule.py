@@ -1,4 +1,4 @@
-"""One launchd invocation, fixed to this project's authorized Paper session.
+"""One scheduler invocation, fixed to this project's authorized Paper session.
 
 Never enables trading, retries a tick, changes policy, or invokes Codex.
 """
@@ -12,6 +12,8 @@ import plistlib
 import signal
 import sqlite3
 import subprocess
+import sys
+import urllib.request
 from datetime import UTC, datetime
 from decimal import Decimal
 from logging.handlers import RotatingFileHandler
@@ -54,6 +56,32 @@ class Scheduler:
         self.logger.info(json.dumps({"at": datetime.now(UTC).isoformat(), "kind": kind, **values}))
 
     def notify(self, message):
+        webhook = os.environ.get("CRYPTO_AGENT_NOTIFY_WEBHOOK")
+        if webhook:
+            # No retries and no credential-bearing exception text in the audit.
+            payload = json.dumps(
+                {
+                    "source": "crypto-agent",
+                    "mode": "paper",
+                    "message": message,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            ).encode()
+            headers = {"Content-Type": "application/json"}
+            token = os.environ.get("CRYPTO_AGENT_NOTIFY_TOKEN")
+            if token:
+                headers["Authorization"] = "Bearer " + token
+            try:
+                request = urllib.request.Request(webhook, data=payload, headers=headers, method="POST")
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    if not 200 <= response.status < 300:
+                        self.record("notification_unavailable")
+            except Exception:
+                self.record("notification_unavailable")
+            return
+        if sys.platform != "darwin":
+            self.record("notification_unavailable")
+            return
         # argv, not interpolated AppleScript; failure cannot cause a trading retry.
         script = (
             'on run argv\n display notification (item 1 of argv) with title "Crypto Agent · Paper"\nend run'
@@ -214,6 +242,11 @@ class Scheduler:
                     raise RuntimeError("Configuration changed; review scheduler policy before resuming")
                 if check_only:
                     return 0
+                # Liveness is independent of order attempts: Retry-After can legitimately
+                # keep last_started_at unchanged while each scheduled check succeeds.
+                save_json(
+                    self.directory / "heartbeat.json", {"last_checked_at": datetime.now(UTC).isoformat()}
+                )
                 last = status["state"].get("last_started_at")
                 if last and (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds() < INTERVAL:
                     return 0
@@ -299,7 +332,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="Status only; never runs a tick")
     parser.add_argument(
-        "--prepare", action="store_true", help="Write policy and plist while trading is paused"
+        "--prepare",
+        action="store_true",
+        help="Write policy and platform scheduler units while trading is paused",
     )
     args = parser.parse_args()
     scheduler = Scheduler()
@@ -324,9 +359,17 @@ def main():
             },
         )
         save_json(scheduler.directory / "seen-orders.json", scheduler.orders())
-        target = scheduler.directory / f"{LABEL}.plist"
-        target.write_bytes(plistlib.dumps(launch_agent()))
-        print(target)
+        if sys.platform == "linux":
+            from crypto_agent.api.scheduler import systemd_units
+
+            for name, content in systemd_units(ROOT).items():
+                target = scheduler.directory / name
+                target.write_text(content)
+                print(target)
+        else:
+            target = scheduler.directory / f"{LABEL}.plist"
+            target.write_bytes(plistlib.dumps(launch_agent()))
+            print(target)
         return 0
     return scheduler.run(check_only=args.check)
 

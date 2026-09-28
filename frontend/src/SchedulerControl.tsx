@@ -88,7 +88,7 @@ export function SchedulerControl() {
       if (mounted.current) {
         setStatus(result);
         setStale(false);
-        setNotice(action === "start" ? "已启用；等待下一次 launchd 定时触发。" : "已停止新提交和本地调度。已受理订单仍需核对。");
+        setNotice(action === "start" ? "已启用；等待下一次定时触发。" : "已停止新提交和调度。已受理订单仍需核对。");
       }
     } catch (failure) {
       if (mounted.current) setError(failure instanceof Error && failure.name === "Error"
@@ -111,7 +111,7 @@ export function SchedulerControl() {
         <div className="scheduler-heading">
           <span className={`dot ${on ? "green" : "amber"}`} />
           <h2>自动交易</h2>
-          <span className="scheduler-source">本地脚本 · launchd · Paper</span>
+          <span className="scheduler-source">自动调度 · Paper</span>
         </div>
         <p className="scheduler-state">
           {stale ? "状态连接中断 · 保留上次结果" : status ? labels[status.state] || status.state : "正在读取调度状态…"}

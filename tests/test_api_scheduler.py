@@ -282,3 +282,145 @@ def test_start_cli_success_without_real_enable_is_repaused(control):
     with pytest.raises(ControlError, match="启动结果未能确认"):
         control.apply("start")
     assert control.pause.exists()
+
+
+@pytest.fixture
+def linux_control(control):
+    from crypto_agent.api.scheduler import SYSTEMD_SERVICE, SYSTEMD_TIMER, systemd_units
+
+    control.platform = "linux"
+    control.unit_directory.mkdir(parents=True)
+    for name, content in systemd_units(control.root).items():
+        (control.unit_directory / name).write_text(content)
+    mac_run = control.runner
+    control.systemd_drift = False
+
+    def run(args, **kwargs):
+        if args[0] != "/usr/bin/systemctl":
+            return mac_run(args, **kwargs)
+        control.calls.append(args)
+        assert args[1] == "--user"
+        action = args[2]
+        if control.fail_on == action:
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        if action == "show":
+            unit = args[3]
+            active = control.fake_loaded if unit == SYSTEMD_TIMER else control.fake_running
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"LoadState=loaded\nActiveState={'active' if active else 'inactive'}\n"
+                    f"FragmentPath={control.unit_directory / unit}\nDropInPaths=\n"
+                    f"NeedDaemonReload={'yes' if control.systemd_drift else 'no'}\n"
+                ),
+                stderr="",
+            )
+        assert control.pause.exists(), "pause must precede scheduler changes"
+        if action == "enable":
+            assert args[3:] == ["--now", SYSTEMD_TIMER]
+            control.fake_loaded = True
+        elif action == "disable":
+            assert args[3:] == ["--now", SYSTEMD_TIMER]
+            control.fake_loaded = False
+        elif action == "stop":
+            assert args[3:] == [SYSTEMD_SERVICE]
+            control.fake_running = False
+        else:
+            pytest.fail(f"Unexpected systemd command: {args}")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    control.runner = run
+    return control
+
+
+def test_linux_start_arms_timer_without_direct_tick(linux_control):
+    linux_control.fake_loaded = False
+    result = linux_control.apply("start")
+    assert result["enabled"] and result["state"] == "waiting"
+    assert [
+        "/usr/bin/systemctl",
+        "--user",
+        "enable",
+        "--now",
+        "crypto-agent-paper.timer",
+    ] in linux_control.calls
+    assert not any(
+        "auto-tick" in args or "crypto-agent-paper.service" in args and "start" in args
+        for args in linux_control.calls
+    )
+    linux_control.apply("start")
+    assert sum("auto-enable" in args for args in linux_control.calls) == 1
+
+
+def test_linux_stop_terminates_tick_even_with_inactive_timer(linux_control):
+    linux_control.pause.unlink()
+    linux_control.fake_loaded = False
+    linux_control.fake_running = True
+    with (linux_control.directory / "scheduler.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = linux_control.apply("stop")
+    assert not result["running"] and not result["loaded"] and not result["enabled"]
+    assert linux_control.pause.exists()
+
+
+@pytest.mark.parametrize("drift", ["unit_file", "loaded_manager"])
+def test_linux_start_refuses_unit_drift(linux_control, drift):
+    if drift == "unit_file":
+        path = linux_control.unit_directory / "crypto-agent-paper.service"
+        path.write_text(path.read_text().replace("Restart=no", "Restart=always"))
+    else:
+        linux_control.systemd_drift = True
+    with pytest.raises(ControlError):
+        linux_control.apply("start")
+    assert linux_control.pause.exists()
+    assert not any("auto-enable" in args or "enable" in args for args in linux_control.calls)
+
+
+def test_linux_start_command_failure_preserves_pause(linux_control):
+    linux_control.fake_loaded = False
+    linux_control.fail_on = "enable"
+    with pytest.raises(ControlError):
+        linux_control.apply("start")
+    assert linux_control.pause.exists()
+    assert not any("auto-enable" in args for args in linux_control.calls)
+
+
+def test_scheduler_health_checks_freshness_and_allows_active_inflight(linux_control):
+    from datetime import UTC, datetime, timedelta
+
+    linux_control.pause.unlink()
+    linux_control.fake_running = True
+    (linux_control.directory / "inflight.json").write_text("{}")
+    for age, expected in [(0, "ok"), (1300, "degraded")]:
+        state = {
+            "enabled": True,
+            "approval_digest": "approved",
+            "last_started_at": (datetime.now(UTC) - timedelta(seconds=age)).isoformat(),
+        }
+        with sqlite3.connect(linux_control.database) as db:
+            db.execute("UPDATE metadata SET value=? WHERE key='automatic_policy'", (json.dumps(state),))
+        assert linux_control.health()["status"] == expected
+    linux_control.write_pause()
+    assert linux_control.health()["status"] == "degraded"
+
+
+def test_health_uses_scheduler_heartbeat_during_long_read_cooldown(linux_control):
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    linux_control.pause.unlink()
+    policy = {
+        "enabled": True,
+        "approval_digest": "approved",
+        "last_started_at": (now - timedelta(hours=2)).isoformat(),
+        "read_retry_not_before": (now + timedelta(hours=2)).isoformat(),
+    }
+    with sqlite3.connect(linux_control.database) as db:
+        db.execute("UPDATE metadata SET value=? WHERE key='automatic_policy'", (json.dumps(policy),))
+    heartbeat = linux_control.directory / "heartbeat.json"
+    heartbeat.write_text(json.dumps({"last_checked_at": now.isoformat()}))
+    assert linux_control.health()["status"] == "ok"
+    heartbeat.write_text(json.dumps({"last_checked_at": (now - timedelta(seconds=1300)).isoformat()}))
+    assert linux_control.health()["status"] == "degraded"
+    heartbeat.write_text("broken")
+    assert linux_control.health()["status"] == "degraded"

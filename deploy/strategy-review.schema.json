@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "as_of_utc": {"type": "string"},
+    "status": {"type": "string", "enum": ["normal", "attention", "blocked"]},
+    "summary": {"type": "string"},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "severity": {"type": "string", "enum": ["info", "warning", "critical"]},
+          "finding": {"type": "string"},
+          "evidence": {"type": "string"},
+          "next_step": {"type": "string"}
+        },
+        "required": ["severity", "finding", "evidence", "next_step"]
+      }
+    }
+  },
+  "required": ["as_of_utc", "status", "summary", "findings"]
+}

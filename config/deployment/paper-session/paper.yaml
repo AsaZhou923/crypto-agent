@@ -1,0 +1,14 @@
+environment: paper
+broker: alpaca_paper
+base_url: https://paper-api.alpaca.markets
+trading_enabled: true
+symbols:
+- BTC/USD
+- XRP/USD
+trigger: scheduled
+database_path: runtime/paper-session/trading.sqlite
+request_timeout_seconds: 15
+market_data_source: alpaca_crypto_us_orderbook
+fresh_market_wait_seconds: 60
+automatic_interval_seconds: 300
+automatic_symbols_per_cycle: 2

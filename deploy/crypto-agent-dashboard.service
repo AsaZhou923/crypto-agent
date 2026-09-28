@@ -1,0 +1,16 @@
+[Unit]
+Description=Crypto Agent Paper monitoring dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/optiplex/services/crypto-agent
+ExecStart=/home/optiplex/services/crypto-agent/.venv/bin/python -m crypto_agent.api --config runtime/paper-session --port 8766 --external-origin https://optiplex.tail8fb77a.ts.net:8447
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

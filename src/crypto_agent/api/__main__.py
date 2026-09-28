@@ -17,11 +17,12 @@ def main():
         "--config", type=Path, default=Path("config"), help="Existing project configuration directory"
     )
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--external-origin", help="Exact HTTPS .ts.net origin served by Tailscale Serve")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
     uvicorn.run(
-        create_app(demo_mode=args.demo, config_dir=args.config),
+        create_app(demo_mode=args.demo, config_dir=args.config, external_origin=args.external_origin),
         host="127.0.0.1",
         port=args.port,
         log_level="warning",

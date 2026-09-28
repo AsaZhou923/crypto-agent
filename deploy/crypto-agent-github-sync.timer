@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Crypto Agent source and strategy changes for GitHub sync
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=10min
+Persistent=false
+Unit=crypto-agent-github-sync.service
+
+[Install]
+WantedBy=timers.target

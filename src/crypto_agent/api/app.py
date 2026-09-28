@@ -39,7 +39,36 @@ class SchedulerAction(BaseModel):
     action: Literal["start", "stop"]
 
 
-def create_app(*, demo_mode=False, config_dir=Path("config"), root=None, monitor=None, scheduler=None):
+def tailnet_origin(value: str | None) -> str | None:
+    if value is None:
+        return None
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or not parsed.hostname.endswith(".ts.net")
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("External origin must be an exact HTTPS Tailscale origin without a path")
+    _ = parsed.port  # Reject malformed ports at startup.
+    return value
+
+
+def create_app(
+    *,
+    demo_mode=False,
+    config_dir=Path("config"),
+    root=None,
+    monitor=None,
+    scheduler=None,
+    external_origin=None,
+):
+    external_origin = tailnet_origin(external_origin)
+    external_host = urlsplit(external_origin).netloc if external_origin else None
     monitor = monitor or Monitor(demo_mode=demo_mode, config_dir=config_dir, root=root)
 
     scheduler = scheduler or SchedulerControl(monitor)
@@ -63,16 +92,20 @@ def create_app(*, demo_mode=False, config_dir=Path("config"), root=None, monitor
 
     @app.middleware("http")
     async def loopback_only(request: Request, call_next):
-        if not local_origin("http://" + request.headers.get("host", "")):
+        host = request.headers.get("host", "")
+        is_tailnet = external_host is not None and host == external_host
+        if not is_tailnet and not local_origin("http://" + host):
             return JSONResponse({"detail": "Loopback Host required"}, status_code=403)
         origin = request.headers.get("origin")
-        if origin and not local_origin(origin):
+        if origin and not local_origin(origin) and origin != external_origin:
             return JSONResponse({"detail": "Local origin required"}, status_code=403)
         if request.headers.get("sec-fetch-site") == "cross-site":
             return JSONResponse({"detail": "Cross-site access disabled"}, status_code=403)
         control = request.method == "POST" and request.url.path == "/api/scheduler"
         if control:
-            expected_origin = f"{request.url.scheme}://{request.url.netloc}"
+            expected_origin = (
+                external_origin if is_tailnet else f"{request.url.scheme}://{request.url.netloc}"
+            )
             if origin != expected_origin or request.headers.get("x-crypto-agent-control") != "1":
                 return JSONResponse({"detail": "Same-origin control request required"}, status_code=403)
         elif request.method not in {"GET", "HEAD"}:
@@ -126,6 +159,11 @@ def create_app(*, demo_mode=False, config_dir=Path("config"), root=None, monitor
             "mode": "demo" if monitor.demo_mode else "paper",
             "read_only": not scheduler.supported(),
         }
+
+    @app.get("/api/health/scheduler")
+    def scheduler_health():
+        value = scheduler.health()
+        return SafeJSONResponse(value, status_code=200 if value["status"] == "ok" else 503)
 
     @app.get("/{path:path}")
     def static(path: str):

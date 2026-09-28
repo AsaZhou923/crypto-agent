@@ -1,0 +1,13 @@
+[Unit]
+Description=Sync Crypto Agent code and Paper strategy to GitHub
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/optiplex/services/crypto-agent
+ExecStart=/home/optiplex/services/crypto-agent/.venv/bin/python /home/optiplex/services/crypto-agent/scripts/github_sync.py
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/home/optiplex/services/crypto-agent/runtime/local-scheduler/notification.env
+UMask=0077
+TimeoutStartSec=300
+Restart=no

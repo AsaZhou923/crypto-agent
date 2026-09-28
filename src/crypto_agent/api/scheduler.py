@@ -1,4 +1,4 @@
-"""Bounded control of the one approved local Paper LaunchAgent; never executes a tick."""
+"""Bounded control of the approved Paper scheduler; never executes a tick."""
 
 import fcntl
 import json
@@ -19,6 +19,42 @@ from crypto_agent.models import AgentError
 LABEL = "com.ze.crypto-agent.paper"
 SYMBOLS = ["BTC/USD", "XRP/USD"]
 INTERVAL = 300
+SYSTEMD_SERVICE = "crypto-agent-paper.service"
+SYSTEMD_TIMER = "crypto-agent-paper.timer"
+
+
+def systemd_units(root):
+    """Exact user units approved by dashboard control and emitted by --prepare."""
+    return {
+        SYSTEMD_SERVICE: f"""[Unit]
+Description=Crypto Agent approved Paper session
+
+[Service]
+Type=oneshot
+WorkingDirectory={root}
+ExecStart={root}/.venv/bin/python {root}/scripts/paper_schedule.py
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-{root}/runtime/local-scheduler/notification.env
+UMask=0077
+KillMode=control-group
+TimeoutStartSec=960
+TimeoutStopSec=30
+Restart=no
+""",
+        SYSTEMD_TIMER: f"""[Unit]
+Description=Crypto Agent Paper five minute schedule
+
+[Timer]
+OnActiveSec={INTERVAL}s
+OnUnitInactiveSec={INTERVAL}s
+AccuracySec=1s
+Persistent=false
+Unit={SYSTEMD_SERVICE}
+
+[Install]
+WantedBy=timers.target
+""",
+    }
 
 
 class ControlError(Exception):
@@ -35,6 +71,7 @@ class SchedulerControl:
         self.directory = self.root / "runtime/local-scheduler"
         self.database = self.config / "trading.sqlite"
         self.pause = self.database.with_suffix(".auto-paused")
+        self.unit_directory = (home or Path.home()) / ".config/systemd/user"
         self.plist = (home or Path.home()) / "Library/LaunchAgents" / f"{LABEL}.plist"
         self.target = f"gui/{os.getuid()}/{LABEL}"
         self.domain = f"gui/{os.getuid()}"
@@ -46,7 +83,7 @@ class SchedulerControl:
         settings = self.monitor.settings
         return bool(
             not self.monitor.demo_mode
-            and self.platform == "darwin"
+            and self.platform in {"darwin", "linux"}
             and settings
             and settings.mode == "paper"
             and settings.database_path.resolve() == self.database.resolve()
@@ -60,7 +97,44 @@ class SchedulerControl:
         except (OSError, subprocess.TimeoutExpired):
             raise ControlError("本机调度命令失败或超时；请检查本地调度日志。", 503) from None
 
+    def systemd_properties(self, unit):
+        result = self.command(
+            [
+                "/usr/bin/systemctl",
+                "--user",
+                "show",
+                unit,
+                "--property=LoadState,ActiveState,FragmentPath,DropInPaths,NeedDaemonReload",
+            ]
+        )
+        if result.returncode:
+            raise ControlError("无法读取 systemd 用户调度状态。", 503)
+        return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+    def verify_systemd(self):
+        for unit, expected in systemd_units(self.root).items():
+            path = self.unit_directory / unit
+            if path.read_text() != expected:
+                raise ControlError("systemd 调度配置与固定 Paper 策略不匹配。")
+            properties = self.systemd_properties(unit)
+            if (
+                properties.get("LoadState") != "loaded"
+                or properties.get("FragmentPath") != str(path)
+                or properties.get("DropInPaths") != ""
+                or properties.get("NeedDaemonReload") != "no"
+            ):
+                raise ControlError("systemd 已加载配置不匹配或尚未重新加载；禁止启用交易。")
+
     def launch_state(self, *, verify=False):
+        if self.platform == "linux":
+            timer = self.systemd_properties(SYSTEMD_TIMER)
+            service = self.systemd_properties(SYSTEMD_SERVICE)
+            if verify:
+                self.verify_systemd()
+            return (
+                timer.get("ActiveState") in {"active", "activating", "reloading"},
+                service.get("ActiveState") in {"active", "activating", "deactivating", "reloading"},
+            )
         result = self.command(["/bin/launchctl", "print", self.target])
         if result.returncode:
             if "could not find service" in (result.stderr or "").lower():
@@ -103,8 +177,12 @@ class SchedulerControl:
     def approved(self, state):
         settings = load_settings(self.config, "paper", root=self.root)
         policy = json.loads((self.directory / "policy.json").read_text())
-        with self.plist.open("rb") as stream:
-            installed = plistlib.load(stream)
+        installed = None
+        if self.platform == "darwin":
+            with self.plist.open("rb") as stream:
+                installed = plistlib.load(stream)
+        else:
+            self.verify_systemd()
         expected = {
             "Label": LABEL,
             "ProgramArguments": [
@@ -135,7 +213,7 @@ class SchedulerControl:
                 "interval_seconds": INTERVAL,
             }
             or state.get("approval_digest") != settings.digest
-            or installed != expected
+            or (self.platform == "darwin" and installed != expected)
         ):
             raise ControlError("配置、已批准策略或已安装调度任务不匹配；请先核对本地调度配置。")
 
@@ -155,7 +233,7 @@ class SchedulerControl:
             error=None,
         )
         if not value["available"]:
-            value["reason"] = "仅本机 macOS 的固定 Paper 会话支持启停；演示及其他配置不可控制。"
+            value["reason"] = "仅 macOS/Linux 的固定 Paper 会话支持启停；演示及其他配置不可控制。"
             return value
         try:
             value["loaded"], value["running"] = self.launch_state()
@@ -183,11 +261,11 @@ class SchedulerControl:
             if value["enabled"] and not value["loaded"]:
                 value["can_start"] = True
                 value["state"] = "stopped"
-                value["reason"] = "交易授权仍在，但 launchd 未加载；当前不会定时运行。"
+                value["reason"] = "交易授权仍在，但调度器未加载；当前不会定时运行。"
             elif value["state"] == "paused":
                 value["reason"] = "自动交易已暂停；已有平台订单保持原状。"
             elif value["state"] == "waiting":
-                value["reason"] = "等待 launchd 下一轮定时触发。"
+                value["reason"] = "等待下一轮定时触发。"
         except ControlError as exc:
             value.update(state="blocked", reason=str(exc), error=str(exc))
         except AgentError:
@@ -203,6 +281,35 @@ class SchedulerControl:
                 error="本地调度状态读取失败。",
             )
         return value
+
+    def health(self):
+        """Read-only liveness of the approved loop, including a bounded active tick."""
+        state = self.status()
+        reason = state.get("error") or state.get("reason")
+        if not state["available"] or not state["enabled"] or not state["loaded"] or state["error"]:
+            return {"status": "degraded", "reason": reason or "Paper scheduler is not enabled"}
+        try:
+            policy, _ = self.ledger()
+            last = policy.get("last_started_at")
+            heartbeat_path = self.directory / "heartbeat.json"
+            checked = (
+                json.loads(heartbeat_path.read_text()).get("last_checked_at")
+                if heartbeat_path.exists()
+                else last
+            )
+            if not checked:
+                return {"status": "degraded", "reason": "No scheduler activation observed"}
+            age = (datetime.now(UTC) - datetime.fromisoformat(checked)).total_seconds()
+            if age < -60 or age > 900 + INTERVAL + 60:
+                return {"status": "degraded", "reason": "Paper scheduler heartbeat is stale"}
+        except (ValueError, TypeError, AttributeError, OSError, sqlite3.Error):
+            return {"status": "degraded", "reason": "Paper scheduler heartbeat is unreadable"}
+        return {
+            "status": "ok",
+            "reason": "Paper scheduler active",
+            "last_started_at": last,
+            "last_checked_at": checked,
+        }
 
     def write_pause(self):
         # Same persistent switch as Automation.pause(), even during a tick holding the DB lock.
@@ -243,8 +350,17 @@ class SchedulerControl:
                 if action == "stop":
                     # Do not acquire scheduler.lock: an active tick owns it and must be stoppable.
                     self.write_pause()
-                    loaded, _ = self.launch_state()
-                    if loaded:
+                    loaded, running = self.launch_state()
+                    if self.platform == "linux":
+                        # Disable future activation, then terminate any running tick.
+                        for args in (
+                            ["disable", "--now", SYSTEMD_TIMER],
+                            ["stop", SYSTEMD_SERVICE],
+                        ):
+                            result = self.command(["/usr/bin/systemctl", "--user", *args], timeout=40)
+                            if result.returncode:
+                                raise ControlError("交易已暂停，但 systemd 停止失败；请检查调度状态。", 503)
+                    elif loaded or running:
                         result = self.command(["/bin/launchctl", "bootout", self.target], timeout=10)
                         if result.returncode:
                             raise ControlError("交易已暂停，但 launchd 卸载失败；请检查本机调度状态。", 503)
@@ -269,11 +385,14 @@ class SchedulerControl:
                         # Bootstrap while paused, with RunAtLoad=False; never trigger a tick here.
                         self.write_pause()
                         if not loaded:
-                            result = self.command(
-                                ["/bin/launchctl", "bootstrap", self.domain, str(self.plist)], timeout=10
+                            args = (
+                                ["/usr/bin/systemctl", "--user", "enable", "--now", SYSTEMD_TIMER]
+                                if self.platform == "linux"
+                                else ["/bin/launchctl", "bootstrap", self.domain, str(self.plist)]
                             )
+                            result = self.command(args, timeout=10)
                             if result.returncode:
-                                raise ControlError("launchd 加载失败；交易保持暂停。", 503)
+                                raise ControlError("调度器加载失败；交易保持暂停。", 503)
                         result = self.command(
                             [
                                 str(self.root / ".venv/bin/crypto-agent"),

@@ -1,0 +1,10 @@
+[Unit]
+Description=Review Crypto Agent Paper strategy every two hours
+
+[Timer]
+OnCalendar=*-*-* 00/2:20:00
+Persistent=false
+Unit=crypto-agent-strategy-review.service
+
+[Install]
+WantedBy=timers.target

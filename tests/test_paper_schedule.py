@@ -250,3 +250,34 @@ def test_sigterm_pauses_and_terminates_fake_cli(tmp_path):
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+def test_webhook_notification_uses_bearer_and_does_not_retry(tmp_path, monkeypatch):
+    scheduler = module.Scheduler(tmp_path)
+    from unittest.mock import MagicMock
+
+    monkeypatch.setenv("CRYPTO_AGENT_NOTIFY_WEBHOOK", "http://127.0.0.1:5678/webhook/test")
+    monkeypatch.setenv("CRYPTO_AGENT_NOTIFY_TOKEN", "private-test-token")
+    response = MagicMock()
+    response.__enter__.return_value.status = 200
+    send = Mock(return_value=response)
+    monkeypatch.setattr(module.urllib.request, "urlopen", send)
+    module.Scheduler.notify(scheduler, "Paper fill")
+    request = send.call_args.args[0]
+    assert request.headers["Authorization"] == "Bearer private-test-token"
+    assert json.loads(request.data)["message"] == "Paper fill"
+    send.side_effect = RuntimeError("private-test-token")
+    module.Scheduler.notify(scheduler, "Paper fault")
+    assert send.call_count == 2
+    assert "private-test-token" not in (scheduler.directory / "audit.jsonl").read_text()
+
+
+def test_scheduler_heartbeat_records_cooldown_but_not_manual_check(scheduler):
+    scheduler.invoke = Mock(side_effect=[(0, enabled()), (0, {"status": "cooldown"})])
+    assert scheduler.run() == 0
+    heartbeat = scheduler.directory / "heartbeat.json"
+    assert datetime.fromisoformat(json.loads(heartbeat.read_text())["last_checked_at"])
+    before = heartbeat.read_bytes()
+    scheduler.invoke = Mock(return_value=(0, enabled()))
+    assert scheduler.run(check_only=True) == 0
+    assert heartbeat.read_bytes() == before
