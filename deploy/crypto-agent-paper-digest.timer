@@ -1,0 +1,12 @@
+[Unit]
+Description=Crypto Agent Paper summaries at 09:00 and 21:00 JST
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+OnCalendar=*-*-* 21:00:00
+AccuracySec=1s
+Persistent=false
+Unit=crypto-agent-paper-digest.service
+
+[Install]
+WantedBy=timers.target

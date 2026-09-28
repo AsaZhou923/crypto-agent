@@ -76,12 +76,14 @@ class Scheduler:
                 with urllib.request.urlopen(request, timeout=10) as response:
                     if not 200 <= response.status < 300:
                         self.record("notification_unavailable")
+                        return False
             except Exception:
                 self.record("notification_unavailable")
-            return
+                return False
+            return True
         if sys.platform != "darwin":
             self.record("notification_unavailable")
-            return
+            return False
         # argv, not interpolated AppleScript; failure cannot cause a trading retry.
         script = (
             'on run argv\n display notification (item 1 of argv) with title "Crypto Agent · Paper"\nend run'
@@ -95,8 +97,11 @@ class Scheduler:
             )
             if result.returncode:
                 self.record("notification_unavailable")
+                return False
         except (OSError, subprocess.TimeoutExpired):
             self.record("notification_unavailable")
+            return False
+        return True
 
     def write_pause(self, reason):
         # Same persistent switch used by auto-pause, even if CLI/config is broken.
@@ -212,11 +217,11 @@ class Scheduler:
                 messages.append(
                     f"{item.get('symbol')} 参数倍数调整为 {evaluation.get('recommended_multiplier')}"
                 )
-        # Persist before notifying so an unavailable Notification Center never causes duplicates.
+        # The scheduled digest reads these audit events; ordinary trade updates
+        # must not produce immediate push notifications.
         save_json(path, after)
         for message in messages:
             self.record("event", message=message)
-            self.notify("Paper " + message)
 
     def run(self, check_only=False):
         with (self.directory / "scheduler.lock").open("a") as lock:

@@ -179,7 +179,7 @@ def test_timeout_pauses_before_process_group_kill(scheduler, monkeypatch):
     assert popen.call_count == 1
 
 
-def test_notifications_only_new_fill_or_rejection(scheduler):
+def test_trade_events_are_audited_without_immediate_notifications(scheduler):
     scheduler.orders = Mock(
         return_value={
             "ca-1": {
@@ -191,13 +191,15 @@ def test_notifications_only_new_fill_or_rejection(scheduler):
         }
     )
     module.Scheduler.report_changes(scheduler, {"status": "pending"})
-    assert scheduler.notify.call_count == 1
+    scheduler.notify.assert_not_called()
     module.Scheduler.report_changes(scheduler, {"status": "pending"})
-    assert scheduler.notify.call_count == 1
+    scheduler.notify.assert_not_called()
     scheduler.orders.return_value["ca-1"].update(status="filled", filled_quantity="0.002")
     module.Scheduler.report_changes(scheduler, {"status": "no_order"})
-    assert scheduler.notify.call_count == 2
-    assert "0.001" in scheduler.notify.call_args.args[0]
+    scheduler.notify.assert_not_called()
+    events = [json.loads(line) for line in (scheduler.directory / "audit.jsonl").read_text().splitlines()]
+    assert len(events) == 2
+    assert all("0.001" in event["message"] for event in events)
     assert json.loads((scheduler.directory / "seen-orders.json").read_text())["ca-1"]["status"] == "filled"
 
 
@@ -262,12 +264,12 @@ def test_webhook_notification_uses_bearer_and_does_not_retry(tmp_path, monkeypat
     response.__enter__.return_value.status = 200
     send = Mock(return_value=response)
     monkeypatch.setattr(module.urllib.request, "urlopen", send)
-    module.Scheduler.notify(scheduler, "Paper fill")
+    assert module.Scheduler.notify(scheduler, "Paper fill") is True
     request = send.call_args.args[0]
     assert request.headers["Authorization"] == "Bearer private-test-token"
     assert json.loads(request.data)["message"] == "Paper fill"
     send.side_effect = RuntimeError("private-test-token")
-    module.Scheduler.notify(scheduler, "Paper fault")
+    assert module.Scheduler.notify(scheduler, "Paper fault") is False
     assert send.call_count == 2
     assert "private-test-token" not in (scheduler.directory / "audit.jsonl").read_text()
 

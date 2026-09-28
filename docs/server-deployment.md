@@ -15,6 +15,7 @@
 | 面板服务 | `crypto-agent-dashboard.service` |
 | 交易定时器 | `crypto-agent-paper.timer` |
 | 单轮交易服务 | `crypto-agent-paper.service` |
+| 交易汇总定时器 | `crypto-agent-paper-digest.timer` |
 | Codex 两小时策略检查 | `crypto-agent-strategy-review.timer/service` |
 | GitHub 自动同步 | `crypto-agent-github-sync.timer/service` |
 
@@ -60,7 +61,8 @@ systemctl --user stop crypto-agent-paper.service
 - `/api/health/scheduler`：固定 Paper 会话已启用、timer 活跃、策略匹配、无未知提交且调度心跳未超过 1,260 秒时返回 200，否则 503。
 - 调度心跳保存在 `runtime/local-scheduler/heartbeat.json`，只由正常的已批准调度检查更新；`--check` 不刷新心跳。正常 Retry-After 等待不会误报成失联。
 - Kuma 分别监控面板和调度健康，复用已有 `n8n Telegram Alerts` 通知渠道。手动暂停也会让调度监控变为异常；计划维护可同时在 Kuma 暂停对应监控。
-- 成交增量、拒单、正式参数调整、故障停机通过专用 n8n 工作流 `cryptoAgentTelegram1` 发往现有 Telegram 渠道。
+- 成交增量、拒单和参数调整记录在调度审计日志中，由 `crypto-agent-paper-digest.timer` 在东京时间每天 09:00、21:00 汇总一次，经专用 n8n 工作流 `cryptoAgentTelegram1` 发往现有 Telegram 渠道。没有成交时仍发送一条汇总。故障停机继续即时告警。
+- 汇总脚本在调用 webhook 前记录已发送时段，防止重启或通知失败导致同一时段重复推送；服务失败可查看 `crypto-agent-paper-digest.service` 状态及审计日志。
 - 私有配置为 `runtime/local-scheduler/notification.env`（权限 600），包含 `CRYPTO_AGENT_NOTIFY_WEBHOOK` 和 `CRYPTO_AGENT_NOTIFY_TOKEN`；不要提交、输出或覆盖。
 - 通知失败只写 `notification_unavailable` 审计事件，不重试交易；通知不是保证送达的队列。
 
