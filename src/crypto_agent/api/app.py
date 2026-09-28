@@ -99,7 +99,13 @@ def create_app(
         origin = request.headers.get("origin")
         if origin and not local_origin(origin) and origin != external_origin:
             return JSONResponse({"detail": "Local origin required"}, status_code=403)
-        if request.headers.get("sec-fetch-site") == "cross-site":
+        document_navigation = (
+            request.method == "GET"
+            and request.url.path == "/"
+            and request.headers.get("sec-fetch-mode") == "navigate"
+            and request.headers.get("sec-fetch-dest") == "document"
+        )
+        if request.headers.get("sec-fetch-site") == "cross-site" and not document_navigation:
             return JSONResponse({"detail": "Cross-site access disabled"}, status_code=403)
         control = request.method == "POST" and request.url.path == "/api/scheduler"
         if control:

@@ -18,14 +18,31 @@ class Scheduler:
 
 
 def test_tailnet_requires_explicit_host_and_same_origin_control(tmp_path):
+    dist = tmp_path / "frontend/dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text("monitor")
     app = create_app(demo_mode=True, root=tmp_path, external_origin=ORIGIN, scheduler=Scheduler())
     with TestClient(app, base_url=ORIGIN) as client:
         assert client.get("/api/health").status_code == 200
+        navigation = {
+            "sec-fetch-site": "cross-site",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-dest": "document",
+        }
+        assert client.get("/", headers=navigation).status_code == 200
+        assert client.get("/api/health", headers=navigation).status_code == 403
+        assert client.get("/", headers={"sec-fetch-site": "cross-site"}).status_code == 403
         assert client.get("/api/health", headers={"host": "evil.ts.net:8447"}).status_code == 403
         assert client.get("/api/health", headers={"origin": "https://evil.ts.net"}).status_code == 403
         assert client.post("/api/scheduler", json={"action": "start"}).status_code == 403
         headers = {"origin": ORIGIN, "x-crypto-agent-control": "1"}
         assert client.post("/api/scheduler", headers=headers, json={"action": "start"}).status_code == 200
+        assert (
+            client.post(
+                "/api/scheduler", headers={**headers, **navigation}, json={"action": "start"}
+            ).status_code
+            == 403
+        )
         headers["origin"] = "http://localhost"
         assert client.post("/api/scheduler", headers=headers, json={"action": "start"}).status_code == 403
         assert client.get("/api/health/scheduler").status_code == 503
