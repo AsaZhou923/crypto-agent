@@ -110,6 +110,16 @@ def sync():
         raise SyncError("Expected main branch")
     if git("remote", "get-url", "origin").stdout.strip().decode() != REMOTE:
         raise SyncError("Unexpected GitHub remote")
+    # SSH authorizes the push; Git commit headers come from this repository's
+    # configured name and email. Keep automation aligned with the original
+    # author identity that GitHub already associates with the owner account.
+    original_author = git("log", "--max-parents=0", "--format=%an%x00%ae").stdout.strip().split(b"\0")
+    configured_author = [
+        git("config", "--get", "user.name").stdout.strip(),
+        git("config", "--get", "user.email").stdout.strip(),
+    ]
+    if configured_author != original_author:
+        raise SyncError("Git commit identity differs from the repository's original author")
     if git("diff", "--cached", "--name-only").stdout.strip():
         raise SyncError("Existing staged changes require manual review")
     git("fetch", "origin", "main", timeout=120)
