@@ -87,7 +87,7 @@ Codex `btc-paper` 和每两小时策略优化自动化 `paper` 均为 PAUSED。
 
 `crypto-agent-strategy-review.timer` 在 JST 双数小时的 20 分触发 `crypto-agent-strategy-review.service`，不会补跑错过的时间。服务以 optiplex 用户启动本机已经登录的 Codex CLI，用官方 `codex exec --sandbox read-only` 模式检查服务器的 Paper 账本、策略、风控和调度证据。[Codex 非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)支持在脚本和计划任务中运行，并默认只读。
 
-提示词和 JSON 报告格式分别保存在 `deploy/strategy-review.prompt.md` 与 `deploy/strategy-review.schema.json`。每次完整报告存入 `runtime/hourly-strategy-review/<UTC时间>/report.json`，最近报告写入 `server-review-latest.json`；无故障或新问题时保持安静，新的 `attention/blocked` 发现经现有 n8n 通知。Codex 调用有 25 分钟超时，systemd 总超时 30 分钟，失败只发一条检查失败提示。定时器不执行 `auto-tick` 或修改生产文件。
+提示词和 JSON 报告格式分别保存在 `deploy/strategy-review.prompt.md` 与 `deploy/strategy-review.schema.json`。每次完整报告存入 `runtime/hourly-strategy-review/<UTC时间>/report.json`，最近报告写入 `server-review-latest.json`；`attention/blocked` 结果仅保存在服务器，不发送 Telegram 通知。Codex 调用有 25 分钟超时，systemd 总超时 30 分钟；失败写入该次目录的 `failure.json` 并返回失败状态，同样不发送 Telegram 通知。定时器不执行 `auto-tick` 或修改生产文件。
 
 2026-09-28 20:15–20:20 JST 已完成首份服务器 Codex 检查，服务退出码 0，JSON 报告为 `attention`：XRP/USD 分钟线持续缺口、信号被安全过滤；没有发现未知提交或当前风控停机。下一次计划触发为 22:20 JST。
 

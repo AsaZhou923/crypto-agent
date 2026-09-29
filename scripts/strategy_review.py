@@ -1,7 +1,6 @@
 """Run a bounded, read-only Codex review of the single Paper session."""
 
 import fcntl
-import hashlib
 import json
 import os
 import subprocess
@@ -24,12 +23,6 @@ def atomic_json(path: Path, value: dict) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     temporary.replace(path)
-
-
-def notify(message: str) -> None:
-    from paper_schedule import Scheduler
-
-    Scheduler(ROOT).notify(message)
 
 
 def main() -> int:
@@ -80,30 +73,11 @@ def main() -> int:
             ):
                 raise ValueError("Invalid Codex review output")
             previous = DIRECTORY / "server-review-latest.json"
-            prior = json.loads(previous.read_text()) if previous.exists() else None
-            key = hashlib.sha256(
-                json.dumps(
-                    {
-                        "status": report["status"],
-                        "findings": [
-                            (item["severity"], item["finding"], item["next_step"])
-                            for item in report["findings"]
-                        ],
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ).encode()
-            ).hexdigest()
-            old_key = prior.get("notification_digest") if prior else None
-            report["notification_digest"] = key
             atomic_json(previous, report)
-            if report["status"] != "normal" and key != old_key:
-                notify("Paper 两小时策略检查：" + report["summary"][:500])
             return 0
         except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired, RuntimeError):
             failure = {"at": datetime.now(UTC).isoformat(), "status": "failed"}
             atomic_json(run_dir / "failure.json", failure)
-            notify("Paper 两小时策略检查未完成；请查看服务器 Codex 检查服务日志。")
             return 1
 
 
