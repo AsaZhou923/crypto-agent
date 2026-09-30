@@ -14,12 +14,57 @@ from pathlib import Path
 
 from crypto_agent.data.features import build_intraday_features
 from crypto_agent.evaluation import Observation, replay_policy
-from crypto_agent.models import AgentError, AssetRules, MarketSnapshot, PriceBar, dumps, timestamp
+from crypto_agent.models import AgentError, AssetRules, MarketSnapshot, PriceBar, decimal, dumps, timestamp
 
-VARIANTS = ("incumbent", "entry_score_3", "aligned_short_trend")
+COHORT_VERSIONS = {
+    "intraday-ai-1min-v3-capped-probe",
+    "intraday-ai-1min-v5.1-low-turnover-paper",
+    "intraday-ai-1min-v5.2-economic-low-turnover-paper",
+}
+VARIANTS = (
+    "incumbent",
+    "entry_score_3",
+    "aligned_short_trend",
+    "cost_cover",
+    "cooldown30",
+    "cost_cover_cooldown30",
+)
 
 
-def filtered_observation(observation, features, variant):
+def _replay_cadence(config):
+    paper = config.get("paper", {})
+    interval = paper.get("automatic_interval_seconds", 600)
+    symbols_per_cycle = paper.get("automatic_symbols_per_cycle", 1)
+    if (
+        type(interval) is not int
+        or not 60 <= interval <= 3600
+        or type(symbols_per_cycle) is not int
+        or not 1 <= symbols_per_cycle <= 3
+    ):
+        raise AgentError("Research requires valid automatic Paper cadence")
+    return interval, interval * symbols_per_cycle
+
+
+def _cost_cover(observation, features, risk):
+    if risk is None:
+        raise AgentError("Entry research cost_cover requires risk buffers")
+    bid, ask = decimal(observation.bid), decimal(observation.ask)
+    if not 0 < bid <= ask:
+        raise AgentError("Entry research requires a valid saved quote")
+    spread_bps = (ask - bid) / ((ask + bid) / 2) * Decimal(10000)
+    cost_bps = spread_bps + 2 * (decimal(risk["fee_buffer_bps"]) + decimal(risk["slippage_bps"]))
+    gross_move_bps = max(
+        Decimal(0),
+        features.return_3m_bps,
+        features.return_10m_bps,
+        features.return_30m_bps,
+    )
+    return gross_move_bps >= cost_bps
+
+
+def filtered_observation(
+    observation, features, variant, *, risk=None, last_entry_at=None, cooldown_seconds=1800
+):
     """Only suppress existing Buy/Overweight signals; never invent a trade."""
     if variant not in VARIANTS:
         raise AgentError("Unknown research entry filter")
@@ -27,15 +72,19 @@ def filtered_observation(observation, features, variant):
         return observation
     if features is None:
         raise AgentError("Entry research requires original validated features")
-    passes = (
-        features.momentum_score >= 3
-        if variant == "entry_score_3"
-        else (
+    passes = True
+    if variant == "entry_score_3":
+        passes = features.momentum_score >= 3
+    elif variant == "aligned_short_trend":
+        passes = (
             features.return_3m_bps >= Decimal(2)
             and features.return_10m_bps >= Decimal(3)
             and features.ema_5_vs_20_bps >= Decimal("1.5")
         )
-    )
+    elif variant in {"cost_cover", "cost_cover_cooldown30"}:
+        passes = _cost_cover(observation, features, risk)
+    if passes and variant in {"cooldown30", "cost_cover_cooldown30"} and last_entry_at is not None:
+        passes = (observation.available_at - last_entry_at).total_seconds() >= cooldown_seconds
     return observation if passes else replace(observation, rating="REVIEW", actionable=False)
 
 
@@ -103,7 +152,7 @@ def compare(snapshot: Path, asset_file: Path):
             if (
                 item.get("config_digest") == cohort_digest
                 and item.get("symbol") in {"BTC/USD", "XRP/USD"}
-                and item.get("strategy_version") == "intraday-ai-1min-v3-capped-probe"
+                and item.get("strategy_version") in COHORT_VERSIONS
                 and item.get("mode") == "paper"
             ):
                 eligible.append(row)
@@ -117,6 +166,7 @@ def compare(snapshot: Path, asset_file: Path):
         if len(signatures) != 1:
             raise AgentError("Research cannot mix effective run configurations")
         config = json.loads(eligible[-1]["config_json"])
+        min_interval_seconds, max_gap_seconds = _replay_cadence(config)
         strategy = config["strategy"]
         if any(
             json.loads(row["body"]).get("model") != "openai:" + strategy["quick_think_llm"]
@@ -132,9 +182,14 @@ def compare(snapshot: Path, asset_file: Path):
                 "incumbent": "Recorded AI ratings unchanged",
                 "entry_score_3": "Suppress recorded entries with momentum score below 3",
                 "aligned_short_trend": "Suppress entries unless 3m >=2bps, 10m >=3bps and EMA5/20 >=1.5bps",
+                "cost_cover": "Suppress entries whose saved quote spread, fee and slippage buffers exceed the original move proxy",
+                "cooldown30": "Suppress entries less than 30 minutes after a prior retained training entry",
+                "cost_cover_cooldown30": "Apply both training-only cost_cover and cooldown30 filters",
             },
             "config_digest": cohort_digest,
             "effective_run_config_digest": eligible[-1]["config_digest"],
+            "replay_min_interval_seconds": min_interval_seconds,
+            "replay_max_gap_seconds": max_gap_seconds,
             "symbols": {},
         }
         for symbol in ("BTC/USD", "XRP/USD"):
@@ -144,7 +199,7 @@ def compare(snapshot: Path, asset_file: Path):
                 if (
                     item.get("config_digest") == cohort_digest
                     and item.get("symbol") == symbol
-                    and item.get("strategy_version") == "intraday-ai-1min-v3-capped-probe"
+                    and item.get("strategy_version") in COHORT_VERSIONS
                     and item.get("mode") == "paper"
                     and item.get("model") == "openai:" + strategy["quick_think_llm"]
                 ):
@@ -165,7 +220,11 @@ def compare(snapshot: Path, asset_file: Path):
                         segment = []
                     excluded.append({"id": row["id"], "reason": str(exc)})
                     continue
-                if segment and (observation.observed_at - segment[-1][0].observed_at).total_seconds() > 1800:
+                if (
+                    segment
+                    and (observation.observed_at - segment[-1][0].observed_at).total_seconds()
+                    > max_gap_seconds
+                ):
                     segments.append(segment)
                     segment = []
                 segment.append((observation, features))
@@ -186,7 +245,19 @@ def compare(snapshot: Path, asset_file: Path):
                 replays = []
                 suppressed = 0
                 for part in segments:
-                    filtered = [filtered_observation(o, f, variant) for o, f in part]
+                    filtered = []
+                    last_entry_at = None
+                    for observation, features in part:
+                        current = filtered_observation(
+                            observation,
+                            features,
+                            variant,
+                            risk=config["risk"],
+                            last_entry_at=last_entry_at,
+                        )
+                        filtered.append(current)
+                        if current.rating in {"Buy", "Overweight"} and current.actionable:
+                            last_entry_at = current.available_at
                     suppressed += sum(
                         new.rating != old.rating for new, (old, _) in zip(filtered, part, strict=True)
                     )
@@ -197,7 +268,8 @@ def compare(snapshot: Path, asset_file: Path):
                         Decimal(1),
                         asset=asset,
                         probe_config=strategy,
-                        max_gap_seconds=1800,
+                        max_gap_seconds=max_gap_seconds,
+                        min_interval_seconds=min_interval_seconds,
                     )
                     replays.append(
                         {

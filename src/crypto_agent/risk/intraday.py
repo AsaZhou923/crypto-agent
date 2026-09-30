@@ -3,6 +3,7 @@
 from decimal import Decimal
 
 from crypto_agent.config import validate_intraday_policy
+from crypto_agent.data.features import build_intraday_features
 from crypto_agent.models import AgentError, RiskResult, decimal
 
 BPS = Decimal(10000)
@@ -42,3 +43,40 @@ def validate_intraday_order(order, market, portfolio, strategy, risk) -> RiskRes
         return RiskResult(True, ())
     except (AgentError, TypeError, ValueError, ArithmeticError) as exc:
         return RiskResult(False, (str(exc) if isinstance(exc, AgentError) else "Invalid probe budget",))
+
+
+def validate_entry_economics(order, market, decision, bars, strategy, risk) -> RiskResult:
+    """Recompute the opt-in entry economics from saved bars and a fresh quote."""
+    if strategy.get("intraday_require_cost_cover", False) is not True or order.side != "buy":
+        return RiskResult(True, ())
+    try:
+        if decision.rating not in {"Buy", "Overweight"}:
+            return RiskResult(True, ())
+        features = build_intraday_features(
+            market,
+            tuple(bars),
+            lookback_bars=strategy["intraday_lookback_bars"],
+            min_bars=strategy["intraday_min_bars"],
+            max_age_seconds=strategy["intraday_max_bar_age_seconds"],
+            momentum_threshold_bps=decimal(
+                strategy["intraday_momentum_threshold_bps"], "intraday momentum threshold"
+            ),
+            now=decision.created_at,
+        )
+        gross_move_bps = max(
+            Decimal(0),
+            features.return_3m_bps,
+            features.return_10m_bps,
+            features.return_30m_bps,
+        )
+        cost_bps = round_trip_cost_bps(market, risk)
+        if gross_move_bps < cost_bps:
+            raise AgentError(
+                "Intraday entry economics no longer cover current spread, fee and slippage buffers"
+            )
+        return RiskResult(True, ())
+    except (AgentError, TypeError, KeyError, ValueError, ArithmeticError) as exc:
+        return RiskResult(
+            False,
+            (str(exc) if isinstance(exc, AgentError) else "Invalid intraday entry economics",),
+        )

@@ -305,13 +305,23 @@ def test_multi_symbol_report_marks_each_position_with_its_own_market(tmp_path):
                 D(".05"),
                 D(2700),
             ),
+            Activity(
+                "eth-fee",
+                "CFEE",
+                now + timedelta(seconds=4),
+                "ETH/USD",
+                "eth-fee-order",
+                quantity=D("-.001"),
+                price=D(2500),
+                fee_usd=D("2.5"),
+            ),
         ]
     )
-    later = now + timedelta(seconds=4)
+    later = now + timedelta(seconds=5)
     final = PortfolioSnapshot(
         D(9785),
         D(10025),
-        (Position("ETH/USD", D(".05"), D(2500), D(".05")), Position("SOL/USD", D(1), D(100), D(1))),
+        (Position("ETH/USD", D(".049"), D(2500), D(".049")), Position("SOL/USD", D(1), D(100), D(1))),
         later,
         D(9650),
         account_id="paper",
@@ -325,9 +335,171 @@ def test_multi_symbol_report_marks_each_position_with_its_own_market(tmp_path):
     try:
         report = db.report()
         assert report["realized_pnl_gross_usd"] == D(10)
-        assert report["unrealized_pnl_usd"] == D(15)
+        assert report["unrealized_pnl_usd"] == D("14.900")
+        assert report["recorded_fees_usd"] == D("2.5")
         assert report["fill_count"] == 3
         assert report["ledger_matches_position"]
+        assert report["position_quantity_differences"] == {}
         assert set(report["market_observed_at_by_symbol"]) == set(SYMBOLS)
+    finally:
+        db.close()
+
+
+def test_delayed_fee_activity_refreshes_authoritative_asset_fields(tmp_path):
+    db = Database(tmp_path / "fees.sqlite", "paper")
+    now = utcnow()
+    opening = PortfolioSnapshot(
+        D(9995),
+        D(10000),
+        (Position("BTC/USD", D(".0001"), D(50000), D(".0001")),),
+        now,
+        D(9995),
+        account_id="paper",
+    )
+    market = MarketSnapshot("BTC/USD", D(50000), now, D(50000), D(50000), "fixture")
+    db.snapshot(opening, {"BTC/USD": market})
+    db.activities(
+        [
+            Activity(
+                "delayed-fee",
+                "CFEE",
+                now + timedelta(seconds=1),
+                fee_usd=D("5"),
+                currency="USD",
+            )
+        ]
+    )
+    final = PortfolioSnapshot(
+        D("9995"), D("9995"), (), now + timedelta(seconds=2), D("9995"), account_id="paper"
+    )
+    db.snapshot(
+        final, {"BTC/USD": replace(market, observed_at=now + timedelta(seconds=2))}, establish_baseline=False
+    )
+    try:
+        report = db.report()
+        assert report["recorded_fees_usd"] == D("5")
+        assert not report["ledger_matches_position"]
+        assert report["position_quantity_differences"] == {"BTC/USD": "0.0001"}
+        assert report["realized_pnl_gross_usd"] is None
+        assert "not treated as proven pending fees" in report["pending_fee_notice"]
+        db.activities(
+            [
+                Activity(
+                    "delayed-fee",
+                    "CFEE",
+                    now + timedelta(seconds=1),
+                    "BTC/USD",
+                    quantity=D("-0.0001"),
+                    price=D(50000),
+                )
+            ]
+        )
+        report = db.report()
+        assert report["recorded_fees_usd"] == D("5")
+        assert report["unvalued_fee_records"] == 0
+        assert report["ledger_matches_position"]
+        assert report["position_quantity_differences"] == {}
+    finally:
+        db.close()
+
+
+def test_delayed_fee_activity_refreshes_cash_fields_without_losing_asset_fields(tmp_path):
+    db = Database(tmp_path / "fees-reverse.sqlite", "paper")
+    now = utcnow()
+    opening = PortfolioSnapshot(
+        D(9995),
+        D(10000),
+        (Position("BTC/USD", D(".0001"), D(50000), D(".0001")),),
+        now,
+        D(9995),
+        account_id="paper",
+    )
+    market = MarketSnapshot("BTC/USD", D(50000), now, D(50000), D(50000), "fixture")
+    db.snapshot(opening, {"BTC/USD": market})
+    db.activities(
+        [
+            Activity(
+                "delayed-fee",
+                "CFEE",
+                now + timedelta(seconds=1),
+                "BTC/USD",
+                quantity=D("-0.0001"),
+                price=D(50000),
+            )
+        ]
+    )
+    final = PortfolioSnapshot(
+        D("9995"), D("9995"), (), now + timedelta(seconds=2), D("9995"), account_id="paper"
+    )
+    db.snapshot(
+        final, {"BTC/USD": replace(market, observed_at=now + timedelta(seconds=2))}, establish_baseline=False
+    )
+    try:
+        report = db.report()
+        assert report["ledger_matches_position"]
+        assert report["unvalued_fee_records"] == 1
+        db.activities(
+            [
+                Activity(
+                    "delayed-fee",
+                    "CFEE",
+                    now + timedelta(seconds=1),
+                    fee_usd=D("5"),
+                    currency="USD",
+                )
+            ]
+        )
+        report = db.report()
+        assert report["recorded_fees_usd"] == D("5")
+        assert report["unvalued_fee_records"] == 0
+        assert report["ledger_matches_position"]
+        assert report["position_quantity_differences"] == {}
+    finally:
+        db.close()
+
+
+def test_positive_cfee_quantity_fails_closed_without_inventing_debit(tmp_path):
+    db = Database(tmp_path / "positive-fee.sqlite", "paper")
+    now = utcnow()
+    opening = PortfolioSnapshot(
+        D(10000),
+        D(10000),
+        (Position("BTC/USD", D(".0001"), D(50000), D(".0001")),),
+        now,
+        D(10000),
+        account_id="paper",
+    )
+    market = MarketSnapshot("BTC/USD", D(50000), now, D(50000), D(50000), "fixture")
+    db.snapshot(opening, {"BTC/USD": market})
+    db.activities(
+        [
+            Activity(
+                "fee-credit",
+                "CFEE",
+                now + timedelta(seconds=1),
+                "BTC/USD",
+                quantity=D("0.0001"),
+                price=D(50000),
+                fee_usd=D("5"),
+                currency="USD",
+            )
+        ]
+    )
+    final = PortfolioSnapshot(
+        D(10000),
+        D(10000),
+        (Position("BTC/USD", D(".0001"), D(50000), D(".0001")),),
+        now + timedelta(seconds=2),
+        D(10000),
+        account_id="paper",
+    )
+    db.snapshot(
+        final, {"BTC/USD": replace(market, observed_at=now + timedelta(seconds=2))}, establish_baseline=False
+    )
+    try:
+        report = db.report()
+        assert not report["ledger_matches_position"]
+        assert report["position_quantity_differences"] == {}
+        assert report["realized_pnl_gross_usd"] is None
     finally:
         db.close()

@@ -146,7 +146,7 @@ def test_wide_audit_catches_date_only_asset_transfer_but_not_old_cash_seed():
     assert result["daily"]["value"] is None
     broker.kind = "JNLC"
     result = load_performance(broker, MIDNIGHT + timedelta(minutes=2), MIDNIGHT)
-    assert result["daily"]["value"] == "2"
+    assert result["daily"]["value"] is None
 
 
 def test_nonpositive_flow_adjusted_equity_cannot_produce_drawdown_below_100_percent():

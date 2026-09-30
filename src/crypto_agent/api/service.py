@@ -196,11 +196,21 @@ class Monitor:
                     }
                 )
             else:
+                attribution = (
+                    "asset fee attributed to symbol"
+                    if a.kind == "CFEE" and a.symbol and a.quantity < 0
+                    else "USD fee / coin attribution unavailable"
+                    if a.currency == "USD"
+                    else "coin attribution unavailable"
+                )
                 fees.append(
                     {
                         "id": a.activity_id,
                         "order_id": a.order_id,
                         "amount": str(a.fee_usd) if a.fee_usd is not None else None,
+                        "currency": a.currency,
+                        "symbol": a.symbol,
+                        "attribution": attribution,
                         "occurred_at": a.occurred_at.date().isoformat()
                         if a.time_precision == "day"
                         else a.occurred_at.isoformat(),
@@ -314,21 +324,31 @@ class Monitor:
             now = utcnow()
             minutes = {"1Min": 1, "5Min": 5, "1Hour": 60}[timeframe]
             with self.network_lock:
-                payload = broker._request(
-                    "GET",
-                    "/v1beta3/crypto/us/bars",
-                    data=True,
-                    params={
+                raw, page_token, seen_tokens = [], None, set()
+                for _ in range(10):
+                    params = {
                         "symbols": symbol,
                         "timeframe": timeframe,
                         "start": (now - timedelta(minutes=minutes * 400)).isoformat(),
                         "end": now.isoformat(),
                         "sort": "desc",
                         "limit": 180,
-                    },
-                )
+                    }
+                    if page_token:
+                        params["page_token"] = page_token
+                    payload = broker._request("GET", "/v1beta3/crypto/us/bars", data=True, params=params)
+                    page = payload["bars"].get(symbol, [])
+                    if not isinstance(page, list):
+                        raise AgentError("Alpaca K 线响应无效。")
+                    raw.extend(page)
+                    page_token = payload.get("next_page_token")
+                    if len(raw) >= 180 or not page_token:
+                        break
+                    if page_token in seen_tokens:
+                        raise AgentError("Alpaca K 线分页不完整。")
+                    seen_tokens.add(page_token)
             bars = []
-            for row in payload["bars"].get(symbol, []):
+            for row in raw[:180]:
                 values = {
                     key: decimal(row[source])
                     for key, source in [
@@ -355,7 +375,7 @@ class Monitor:
             at = bars[-1]["time"] if bars else None
             stale = bool(at and (now - timestamp(at)).total_seconds() > minutes * 60 + 120)
             notice = "Alpaca crypto US bars；最近最多 180 根，末根可能尚未闭合；行情时间以柱起点为准，成交来自 Paper 执行流水。"
-            if payload.get("next_page_token"):
+            if page_token and len(raw) >= 180:
                 notice += "更早 K 线未加载。"
             if stale:
                 notice += "本次平台查询成功，但最新可用 K 线仍延迟；自动刷新继续，不补造缺失柱。"

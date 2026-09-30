@@ -459,6 +459,27 @@ def test_evaluator_cannot_expand_or_invent_exposure_multiplier(setup, monkeypatc
     assert settings.risk == original_risk
 
 
+def test_evaluator_cannot_invent_observation_count(setup, monkeypatch):
+    _, _, broker, automation = setup
+    automation.enable(explicit=True)
+    seed_observations(automation)
+    monkeypatch.setattr(
+        "crypto_agent.evaluation.evaluate_candidates",
+        Mock(
+            return_value={
+                "status": "reject",
+                "recommended_multiplier": "1",
+                "holdout_evaluated": True,
+                "observation_count": MINIMUM_EVALUATION_SAMPLES + 1,
+            }
+        ),
+    )
+    before = automation._state()
+    with pytest.raises(AgentError, match="invalid observation count"):
+        automation._evaluate(broker.get_asset_rules())
+    assert automation._state() == before
+
+
 def test_evaluator_cannot_restore_exposure_after_a_reduction(setup, monkeypatch):
     _, _, broker, automation = setup
     automation.enable(explicit=True)
@@ -593,6 +614,92 @@ def test_unexamined_holdout_is_retained_across_restart(setup, monkeypatch, resul
         other_db.close()
 
 
+def test_stale_historical_window_is_not_evaluated_as_current_cycle_evidence(setup, monkeypatch):
+    _, db, broker, automation = setup
+    automation.enable(explicit=True)
+    seed_observations(automation)
+    now = utcnow()
+    monkeypatch.setattr(automation_module, "utcnow", lambda: now)
+    state = automation._state()
+    state["last_started_at"] = now.isoformat()
+    automation._save(state)
+    evaluator = Mock(side_effect=AssertionError("stale evidence must not reach evaluator"))
+    monkeypatch.setattr("crypto_agent.evaluation.evaluate_candidates", evaluator)
+    before = automation._state()
+    result = automation._evaluate(broker.get_asset_rules())
+    assert result["status"] == "insufficient_evidence"
+    assert result["holdout_evaluated"] is False
+    assert "is stale" in result["reason"]
+    assert automation._state() == before
+    now += timedelta(seconds=automation.evaluation_gap_seconds)
+    state = automation._state()
+    state["last_started_at"] = now.isoformat()
+    automation._save(state)
+    result = automation._evaluate(broker.get_asset_rules())
+    assert result["status"] == "insufficient_evidence"
+    assert "is stale" in result["reason"]
+    assert automation._state() == state
+    evaluator.assert_not_called()
+    assert db.connection.execute("SELECT count(*) FROM strategy_evaluations").fetchone()[0] == 0
+
+
+def test_status_marks_historical_evaluation_stale_without_mutating_audit(setup, monkeypatch):
+    _, db, broker, automation = setup
+    now = utcnow()
+    monkeypatch.setattr(automation_module, "utcnow", lambda: now)
+    automation.enable(explicit=True)
+    seed_observations(automation)
+    rows = db.connection.execute("SELECT id,body FROM strategy_observations ORDER BY id").fetchall()
+    latest_available = now - timedelta(seconds=60)
+    first_observed = latest_available - timedelta(seconds=600 * (len(rows) - 1) + 1)
+    with db.connection:
+        for index, row in enumerate(rows):
+            body = json.loads(row["body"])
+            observed = first_observed + timedelta(seconds=600 * index)
+            body["observed_at"] = observed
+            body["available_at"] = observed + timedelta(seconds=1)
+            db.connection.execute(
+                "UPDATE strategy_observations SET body=? WHERE id=?", (dumps(body), row["id"])
+            )
+    result = automation._evaluate(broker.get_asset_rules())
+    assert result["holdout_evaluated"] is True
+    state = automation._state()
+    state["last_started_at"] = (now - timedelta(seconds=300)).isoformat()
+    automation._save(state)
+    status = automation.status()
+    audit = status["last_evaluation"]
+    assert audit["audit"]["evaluated_at"]
+    assert audit["selected_last_observation_id"] == MINIMUM_EVALUATION_SAMPLES
+    assert audit["current_status"]["status"] == "current"
+    assert status["evaluation_diagnostics_by_symbol"]["BTC/USD"]["status"] == "current"
+    saved = automation._state()
+    now += timedelta(seconds=automation.evaluation_gap_seconds + 1)
+    stale = automation.status()
+    assert stale["state"] == saved
+    assert stale["last_evaluation"]["selected_last_observation_id"] == audit["selected_last_observation_id"]
+    assert stale["last_evaluation"]["current_status"]["status"] == "insufficient_evidence"
+    assert "is stale" in stale["last_evaluation"]["current_status"]["reason"]
+    assert stale["evaluation_diagnostics_by_symbol"]["BTC/USD"]["raw_new_observations"] == 0
+    assert stale["evaluation_diagnostics_by_symbol"]["BTC/USD"]["current_config_observations"] == 0
+
+
+def test_status_marks_future_evidence_invalid_without_cycle_started(setup, monkeypatch):
+    _, db, _, automation = setup
+    now = utcnow()
+    monkeypatch.setattr(automation_module, "utcnow", lambda: now)
+    automation.enable(explicit=True)
+    seed_observations(automation, 1)
+    row = db.connection.execute("SELECT id,body FROM strategy_observations").fetchone()
+    body = json.loads(row["body"])
+    body["available_at"] = now + timedelta(seconds=1)
+    with db.connection:
+        db.connection.execute("UPDATE strategy_observations SET body=? WHERE id=?", (dumps(body), row["id"]))
+    status = automation.status()
+    diagnostic = status["evaluation_diagnostics_by_symbol"]["BTC/USD"]
+    assert diagnostic["status"] == "invalid_evidence"
+    assert "future" in diagnostic["reason"]
+
+
 def test_146_points_one_second_short_then_append_reaches_readiness(setup):
     _, db, broker, automation = setup
     automation.enable(explicit=True)
@@ -720,6 +827,8 @@ def test_selected_suffix_audit_ids_exclude_old_prefix(setup):
             )
     result = automation._evaluate(broker.get_asset_rules())
     assert result["excluded_prefix_count"] == 20
+    assert result["new_samples"] == 146
+    assert result["total_new_samples"] == 166
     assert result["selected_first_observation_id"] == 21
     assert result["selected_last_observation_id"] == 166
     row = db.connection.execute(

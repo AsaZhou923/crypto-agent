@@ -232,6 +232,7 @@ class Activity:
     price: Decimal = Decimal(0)
     fee_usd: Decimal | None = None
     time_precision: str = "instant"
+    currency: str | None = None
 
 
 @dataclass(frozen=True)

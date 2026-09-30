@@ -49,6 +49,11 @@ def setup(tmp_path, monkeypatch):
             "intraday_trade_filter": "confirm2_cooldown30",
             "intraday_probe_max_position_usd": Decimal(5000),
             "intraday_probe_cost_budget_usd": Decimal(75),
+            "intraday_lookback_bars": 60,
+            "intraday_min_bars": 45,
+            "intraday_max_bar_age_seconds": 180,
+            "intraday_momentum_threshold_bps": Decimal(2),
+            "intraday_entry_score": 2,
             "rating_target_pct": {
                 "Buy": Decimal(".05"),
                 "Overweight": Decimal(".03"),
@@ -92,6 +97,41 @@ def confirmed_preview(setup):
     second = scheduled_run(setup)
     assert second["status"] == "preview", second
     return first, second
+
+
+def economic_strategy(clock):
+    def decide(market, portfolio, supplied_bars):
+        assert supplied_bars
+        return TradeDecision(
+            symbol=market.symbol,
+            target_position_pct=Decimal(".01"),
+            reason="Synthetic bullish evidence",
+            expires_at=clock[0] + timedelta(seconds=120),
+            created_at=clock[0],
+            rating="Buy",
+            strategy_version="intraday-ai-1min-v5.2-economic-low-turnover-paper",
+            model="synthetic-test-model",
+            evidence=("Deterministic integration fixture; no external model",),
+        )
+
+    return Mock(requires_intraday_bars=True, bar_request={"timeframe": "1Min", "limit": 61}, decide=decide)
+
+
+def rising_bars(clock, symbol="BTC/USD", count=61):
+    start = clock[0].replace(second=0, microsecond=0) - timedelta(minutes=count)
+    return tuple(
+        PriceBar(
+            symbol,
+            start + timedelta(minutes=index),
+            Decimal(49000 + 20 * index),
+            Decimal(49001 + 20 * index),
+            Decimal(48999 + 20 * index),
+            Decimal(49000 + 20 * index),
+            Decimal(1),
+            "OFFLINE SYNTHETIC TEST DATA",
+        )
+        for index in range(count)
+    )
 
 
 def test_runner_persists_raw_predecessor_before_confirmed_preview(setup):
@@ -220,5 +260,79 @@ def test_execute_preview_rejects_missing_or_tampered_confirmation_before_post(se
     result = execute_preview(settings, broker, db, second["run_id"], explicit=True)
     assert result["status"] == "blocked", result
     assert result["risk"].reasons
+    assert db.order_for_run(second["run_id"])["attempted"] == 0
+    broker.submit_order.assert_not_called()
+
+
+def test_execute_preview_rejects_tampered_economic_entry_admission(setup, monkeypatch):
+    settings, db, broker, strategy, _ = setup
+    settings = replace(
+        settings,
+        strategy={
+            **settings.strategy,
+            "intraday_require_cost_cover": True,
+            "intraday_entry_cooldown_seconds": 1800,
+        },
+    )
+    strategy = economic_strategy(setup[4])
+    monkeypatch.setattr(broker, "get_bars", Mock(side_effect=lambda *args, **kwargs: rising_bars(setup[4])))
+    scoped = settings, db, broker, strategy, setup[4]
+    _, second = confirmed_preview(scoped)
+    with db.connection:
+        db.connection.execute(
+            "UPDATE entry_filter_signals SET admitted=0 WHERE run_id=?", (second["run_id"],)
+        )
+    result = execute_preview(settings, broker, db, second["run_id"], explicit=True)
+    assert result["status"] == "blocked", result
+    assert "approved original evidence" in result["risk"].reasons[0]
+    assert db.order_for_run(second["run_id"])["attempted"] == 0
+    broker.submit_order.assert_not_called()
+
+
+def test_economic_entry_rechecks_saved_bars_against_fresh_execution_quote(setup, monkeypatch):
+    settings, db, broker, strategy, _ = setup
+    settings = replace(
+        settings,
+        strategy={
+            **settings.strategy,
+            "intraday_require_cost_cover": True,
+            "intraday_entry_cooldown_seconds": 1800,
+            "intraday_probe_cost_budget_usd": Decimal("10"),
+        },
+    )
+    strategy = economic_strategy(setup[4])
+    monkeypatch.setattr(broker, "get_bars", Mock(side_effect=lambda *args, **kwargs: rising_bars(setup[4])))
+    scoped = settings, db, broker, strategy, setup[4]
+    _, second = confirmed_preview(scoped)
+    market = broker.get_market
+    broker.get_market = lambda *args: replace(market(*args), bid=Decimal(49610))
+    broker.submit_order = Mock(side_effect=AssertionError("must not POST"))
+    result = execute_preview(settings, broker, db, second["run_id"], explicit=True)
+    assert result["status"] == "blocked", result
+    assert "economics" in result["risk"].reasons[0]
+    assert db.order_for_run(second["run_id"])["attempted"] == 0
+    broker.submit_order.assert_not_called()
+
+
+def test_economic_entry_rejects_tampered_intraday_context_before_post(setup, monkeypatch):
+    settings, db, broker, strategy, _ = setup
+    settings = replace(
+        settings,
+        strategy={
+            **settings.strategy,
+            "intraday_require_cost_cover": True,
+            "intraday_entry_cooldown_seconds": 1800,
+        },
+    )
+    strategy = economic_strategy(setup[4])
+    monkeypatch.setattr(broker, "get_bars", Mock(side_effect=lambda *args, **kwargs: rising_bars(setup[4])))
+    scoped = settings, db, broker, strategy, setup[4]
+    _, second = confirmed_preview(scoped)
+    with db.connection:
+        db.connection.execute("UPDATE intraday_contexts SET body='{}' WHERE run_id=?", (second["run_id"],))
+    broker.submit_order = Mock(side_effect=AssertionError("must not POST"))
+    result = execute_preview(settings, broker, db, second["run_id"], explicit=True)
+    assert result["status"] == "blocked", result
+    assert result["risk"].reasons == ("Invalid stored intraday context",)
     assert db.order_for_run(second["run_id"])["attempted"] == 0
     broker.submit_order.assert_not_called()

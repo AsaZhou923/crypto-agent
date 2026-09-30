@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from crypto_agent.config import validate_intraday_policy
+from crypto_agent.config import validate_intraday_entry_economics, validate_intraday_policy
 from crypto_agent.data.features import IntradayFeatures, build_intraday_features
 from crypto_agent.models import (
     AgentError,
@@ -43,6 +43,8 @@ class IntradayAIStrategy:
             self.version = "intraday-ai-1min-v4.1-expanded-paper"
         if config.get("intraday_trade_filter", "none") == "confirm2_cooldown30":
             self.version = "intraday-ai-1min-v5.1-low-turnover-paper"
+        if config.get("intraday_require_cost_cover", False) is True:
+            self.version = "intraday-ai-1min-v5.2-economic-low-turnover-paper"
         if config.get("asset_type") != "crypto" or config.get("decision_profile") != "intraday_10m":
             raise AgentError("Intraday AI requires crypto mode and intraday_10m profile")
         if config.get("llm_provider") != "openai" or not config.get("quick_think_llm"):
@@ -64,6 +66,7 @@ class IntradayAIStrategy:
         if not 1 <= config["intraday_entry_score"] <= 4:
             raise AgentError("Intraday entry score must be in [1, 4]")
         self.entry_policy = validate_intraday_policy(config)
+        self.require_entry_cost_cover = validate_intraday_entry_economics(config)
         self.momentum_threshold = decimal(
             config.get("intraday_momentum_threshold_bps"), "intraday momentum threshold"
         )
@@ -204,7 +207,7 @@ class IntradayAIStrategy:
                 )
             gross_move_bps, round_trip_cost_bps = self._entry_costs(market, features)
             if (
-                self.entry_policy == "cost_cover"
+                (self.entry_policy == "cost_cover" or self.require_entry_cost_cover)
                 and target > current
                 and gross_move_bps < round_trip_cost_bps
             ):
@@ -302,6 +305,7 @@ class IntradayAIStrategy:
                     "underweight_score_at_most": -self.config["intraday_entry_score"],
                     "sell_score_at_most": -max(self.config["intraday_entry_score"], 3),
                     "entry_policy": self.entry_policy,
+                    "require_cost_cover": self.require_entry_cost_cover,
                     "round_trip_cost_reserve_bps": round_trip_cost_bps(market, self.risk),
                     "probe_position_cap_usd": probe_position_cap(self.config, market, self.risk)
                     if self.entry_policy == "capped_probe"

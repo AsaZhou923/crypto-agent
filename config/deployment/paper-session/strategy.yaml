@@ -32,3 +32,5 @@ baseline_target_pct: 0.001
 backend_url: https://stackoverflow.study/v1
 intraday_probe_profile: expanded_paper
 intraday_trade_filter: confirm2_cooldown30
+intraday_require_cost_cover: true
+intraday_entry_cooldown_seconds: 1800

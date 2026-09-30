@@ -242,10 +242,26 @@ class Database:
                         ),
                     )
                 elif activity.kind in {"CFEE", "FEE"}:
-                    self.connection.execute(
-                        "INSERT OR IGNORE INTO fees VALUES (?,?,?)",
-                        (activity.activity_id, timestamp(activity.occurred_at).isoformat(), dumps(activity)),
-                    )
+                    body = dumps(activity)
+                    existing = self.connection.execute(
+                        "SELECT body FROM fees WHERE activity_id=?", (activity.activity_id,)
+                    ).fetchone()
+                    if not existing:
+                        self.connection.execute(
+                            "INSERT INTO fees VALUES (?,?,?)",
+                            (activity.activity_id, timestamp(activity.occurred_at).isoformat(), body),
+                        )
+                    else:
+                        merged = _merge_fee_activity(json.loads(existing["body"]), json.loads(body))
+                        if merged is not None and merged != json.loads(existing["body"]):
+                            self.connection.execute(
+                                "UPDATE fees SET occurred_at=?, body=? WHERE activity_id=?",
+                                (
+                                    timestamp(activity.occurred_at).isoformat(),
+                                    dumps(merged),
+                                    activity.activity_id,
+                                ),
+                            )
                 else:
                     raise AgentError("Unsupported broker activity type")
 
@@ -335,13 +351,20 @@ class Database:
                     symbol = activity["symbol"]
                     quantity = quantities.get(symbol, Decimal(0))
                     cost = costs.get(symbol, Decimal(0))
-                    reduction = abs(qty)
-                    if quantity >= reduction and quantity > 0:
-                        cost -= reduction * cost / quantity
-                        quantity -= reduction
+                    if qty < 0:
+                        reduction = abs(qty)
+                        if quantity >= reduction and quantity > 0:
+                            cost -= reduction * cost / quantity
+                            quantity -= reduction
+                        else:
+                            complete = False
+                        quantities[symbol], costs[symbol] = quantity, cost
+                    elif qty > 0:
+                        complete = False
+                        quantities[symbol], costs[symbol] = quantity, cost
                     else:
                         complete = False
-                    quantities[symbol], costs[symbol] = quantity, cost
+                        quantities[symbol], costs[symbol] = quantity, cost
         p = last["portfolio"]
         latest_markets = {}
         for row in self.connection.execute(
@@ -357,12 +380,20 @@ class Database:
             mark = decimal(latest_markets[pos["symbol"]]["price"])
             unrealized += decimal(pos["quantity"]) * (mark - decimal(pos["average_entry_price"]))
         observed_quantities = {pos["symbol"]: decimal(pos["quantity"]) for pos in p["positions"]}
+        quantity_differences = {}
         for symbol in set(observed_quantities) | set(quantities):
-            if abs(
-                observed_quantities.get(symbol, Decimal(0)) - quantities.get(symbol, Decimal(0))
-            ) > Decimal("0.00000001"):
+            difference = quantities.get(symbol, Decimal(0)) - observed_quantities.get(symbol, Decimal(0))
+            if difference:
+                quantity_differences[symbol] = str(difference)
+            if abs(difference) > Decimal("0.00000001"):
                 complete = False
         paper = self.metadata("mode") == "paper"
+        pending_fee_notice = (
+            "Paper fee attribution is provisional: same-day asset-fee entries may post or enrich later, "
+            "but unresolved position differences are not treated as proven pending fees."
+            if paper
+            else None
+        )
         return {
             "mode": self.metadata("mode"),
             "as_of": p["observed_at"],
@@ -377,12 +408,14 @@ class Database:
             "unrealized_pnl_usd": unrealized,
             "recorded_fees_usd": fee_total,
             "unvalued_fee_records": unknown_fees,
+            "position_quantity_differences": quantity_differences,
             "realized_minus_recorded_fees_usd": gross_realized - fee_total
             if complete and not unknown_fees and not fee_attribution_uncertain
             else None,
             "fill_count": fill_count,
             "ledger_matches_position": complete,
             "fees_may_be_pending": paper,
+            "pending_fee_notice": pending_fee_notice,
             "fee_attribution_uncertain": fee_attribution_uncertain,
             "realized_basis_provisional": fee_attribution_uncertain,
             "basis": "Weighted average cost from opening broker position and subsequent broker FILL activities; unrealized uses latest observed broker position cost and quote midpoint.",
@@ -406,6 +439,30 @@ def intent_from_json(body: str) -> OrderIntent:
     for key in ("quantity", "limit_price", "estimated_notional_usd", "estimated_fee_usd"):
         value[key] = decimal(value[key])
     return OrderIntent(**value)
+
+
+def _merge_fee_activity(current: dict, incoming: dict) -> dict | None:
+    if current.get("kind") != incoming.get("kind"):
+        return None
+    for key in ("activity_id", "occurred_at", "time_precision"):
+        if current.get(key) not in (None, "", 0, "0") and incoming.get(key) not in (None, "", 0, "0"):
+            if current[key] != incoming[key]:
+                return None
+    merged = dict(current)
+    for key in ("fee_usd", "symbol", "currency", "side", "order_id"):
+        if current.get(key) in (None, "") and incoming.get(key) not in (None, ""):
+            merged[key] = incoming[key]
+        elif current.get(key) not in (None, "") and incoming.get(key) not in (None, ""):
+            if current[key] != incoming[key]:
+                return None
+    for key in ("quantity", "price"):
+        current_value = decimal(current.get(key, 0))
+        incoming_value = decimal(incoming.get(key, 0))
+        if current_value == 0 and incoming_value != 0:
+            merged[key] = incoming[key]
+        elif current_value != 0 and incoming_value != 0 and current_value != incoming_value:
+            return None
+    return merged
 
 
 def initialize_database(path: Path) -> None:

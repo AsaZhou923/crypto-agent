@@ -1,6 +1,7 @@
 """Market identity, read-only source isolation and per-market stale retention."""
 
 import time
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -114,6 +115,43 @@ def test_market_cache_and_failed_refresh_are_isolated_by_symbol_and_timeframe():
         assert missing["data"] is None and missing["error"]
         assert missing["source"] == "Alpaca Crypto US"
         assert not broker.allow_submit
+    finally:
+        monitor.close()
+
+
+def test_market_view_follows_short_bar_page_next_token():
+    calls = []
+    start = datetime(2026, 9, 21, 10, 0, tzinfo=UTC)
+
+    def rows(offset, count):
+        return [
+            {
+                "t": (start - timedelta(minutes=offset + index + 1)).isoformat(),
+                "o": "65000",
+                "h": "65002",
+                "l": "64999",
+                "c": "65001",
+                "v": "0",
+            }
+            for index in range(count)
+        ]
+
+    def respond(request):
+        calls.append(request)
+        token = request.url.params.get("page_token")
+        if token is None:
+            return httpx.Response(200, json={"bars": {"BTC/USD": rows(0, 90)}, "next_page_token": "older"})
+        assert token == "older"
+        return httpx.Response(200, json={"bars": {"BTC/USD": rows(90, 90)}, "next_page_token": None})
+
+    broker = AlpacaPaperBroker(PAPER_URL, "test-key", "test-secret", transport=httpx.MockTransport(respond))
+    monitor = Monitor(config_dir=Path("config/demo"), broker=broker)
+    try:
+        result = monitor.market(refresh=True)
+        assert result["error"] is None
+        assert len(result["data"]["bars"]) == 180
+        assert len(calls) == 2
+        assert calls[1].url.params["page_token"] == "older"
     finally:
         monitor.close()
 

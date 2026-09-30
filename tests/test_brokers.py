@@ -363,6 +363,38 @@ def test_minute_bars_preserve_precision_and_request_latest_descending_window():
     assert calls[0].url.params["sort"] == "desc"
 
 
+def test_minute_bars_follow_next_page_token_when_page_is_short():
+    calls = []
+    now = utcnow().replace(second=0, microsecond=0)
+
+    def rows(offset, count):
+        return [
+            {
+                "t": (now - timedelta(minutes=offset + index + 1)).isoformat(),
+                "o": "50000",
+                "h": "50002",
+                "l": "49999",
+                "c": "50001",
+                "v": "0",
+            }
+            for index in range(count)
+        ]
+
+    def handler(request):
+        calls.append(request)
+        token = request.url.params.get("page_token")
+        if token is None:
+            return httpx.Response(200, json={"bars": {"BTC/USD": rows(0, 20)}, "next_page_token": "older"})
+        assert token == "older"
+        return httpx.Response(200, json={"bars": {"BTC/USD": rows(20, 10)}, "next_page_token": None})
+
+    result = broker(handler).get_bars(limit=30)
+    assert len(result) == 30
+    assert len(calls) == 2
+    assert calls[1].url.params["page_token"] == "older"
+    assert result[0].observed_at < result[-1].observed_at
+
+
 @pytest.mark.parametrize(
     "bar",
     [
@@ -525,13 +557,40 @@ def test_crypto_fee_is_valued_without_inventing_a_same_day_zero_fee():
             "symbol": "BTCUSD",
             "qty": "-0.00001",
             "price": "50000",
+            "currency": "USD",
         },
-        {"id": "fee2", "activity_type": "FEE", "date": "2026-09-18", "net_amount": "-1.25"},
+        {
+            "id": "fee2",
+            "activity_type": "FEE",
+            "date": "2026-09-18",
+            "net_amount": "-1.25",
+            "currency": "USD",
+        },
         {"id": "fee3", "activity_type": "CFEE", "date": "2026-09-18", "symbol": "BTCUSD", "qty": "-0.00001"},
+        {
+            "id": "fee4",
+            "activity_type": "CFEE",
+            "date": "2026-09-18",
+            "net_amount": "-1.25",
+            "currency": "EUR",
+        },
+        {
+            "id": "fee5",
+            "activity_type": "CFEE",
+            "date": "2026-09-18",
+            "net_amount": "-1.25",
+            "currency": "EUR",
+            "symbol": "BTCUSD",
+            "qty": "-0.00001",
+            "price": "50000",
+        },
     ]
     activities = broker(lambda _: httpx.Response(200, json=data)).get_activities()
     assert activities[0].quantity == D("-0.00001") and activities[0].fee_usd == D("0.50")
     assert activities[1].fee_usd == D("1.25") and activities[2].fee_usd is None
+    assert activities[3].currency == "EUR" and activities[3].fee_usd is None
+    assert activities[4].currency == "EUR" and activities[4].fee_usd == D("0.50")
+    assert activities[0].currency == "USD" and activities[1].currency == "USD"
     assert all(activity.time_precision == "day" for activity in activities)
 
 

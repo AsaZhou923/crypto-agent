@@ -13,6 +13,7 @@ from crypto_agent.execution.planner import plan_orders
 from crypto_agent.models import (
     TERMINAL_STATUSES,
     AgentError,
+    PriceBar,
     RiskResult,
     decimal,
     dumps,
@@ -21,7 +22,7 @@ from crypto_agent.models import (
     utcnow,
 )
 from crypto_agent.risk.checks import validate_inputs, validate_order
-from crypto_agent.risk.intraday import validate_intraday_order
+from crypto_agent.risk.intraday import validate_entry_economics, validate_intraday_order
 from crypto_agent.storage.database import Database, intent_from_json
 from crypto_agent.strategies.entry_gate import begin_attempt, filter_decision, validate_entry_preview
 
@@ -116,6 +117,33 @@ def _intraday_bars_current(bars, decision, settings, now=None):
     return bool(closed) and 0 <= (now - max(closed)).total_seconds() <= float(
         settings.strategy.get("intraday_max_bar_age_seconds", 180)
     )
+
+
+def _bars_from_json(value):
+    try:
+        raw = json.loads(value)
+        if not isinstance(raw, list):
+            raise ValueError
+        return tuple(
+            PriceBar(
+                **{
+                    **bar,
+                    "observed_at": timestamp(bar["observed_at"]),
+                    **{key: decimal(bar[key], key) for key in ("open", "high", "low", "close", "volume")},
+                }
+            )
+            for bar in raw
+        )
+    except (AgentError, TypeError, KeyError, ValueError, json.JSONDecodeError):
+        raise AgentError("Invalid stored intraday context") from None
+
+
+def _validate_entry_economics_from_context(order, market, decision, context, strategy, risk):
+    try:
+        bars = _bars_from_json(context[0]) if context else ()
+    except AgentError as exc:
+        return RiskResult(False, (str(exc),))
+    return validate_entry_economics(order, market, decision, bars, strategy, risk)
 
 
 def run_once(
@@ -265,6 +293,18 @@ def run_once(
                 result = validate_intraday_order(
                     order, fresh_market, fresh_portfolio, settings.strategy, settings.risk
                 )
+            if result.allowed and "intraday_require_cost_cover" in settings.strategy:
+                context = database.connection.execute(
+                    "SELECT body FROM intraday_contexts WHERE run_id=?", (run_id,)
+                ).fetchone()
+                result = _validate_entry_economics_from_context(
+                    order,
+                    fresh_market,
+                    decision,
+                    context,
+                    settings.strategy,
+                    settings.risk,
+                )
             database.risk(run_id, "preview", result)
             if not result.allowed:
                 database.finish(run_id, "blocked")
@@ -333,6 +373,18 @@ def execute_preview(
         )
         if risk.allowed:
             risk = validate_intraday_order(order, market, portfolio, settings.strategy, settings.risk)
+        if risk.allowed and "intraday_require_cost_cover" in settings.strategy:
+            context = database.connection.execute(
+                "SELECT body FROM intraday_contexts WHERE run_id=?", (run_id,)
+            ).fetchone()
+            risk = _validate_entry_economics_from_context(
+                order,
+                market,
+                decision,
+                context,
+                settings.strategy,
+                settings.risk,
+            )
         database.risk(run_id, "execute", risk)
         if not risk.allowed:
             database.finish(run_id, "blocked")
@@ -375,6 +427,15 @@ def execute_preview(
             context = database.connection.execute(
                 "SELECT body FROM intraday_contexts WHERE run_id=?", (run_id,)
             ).fetchone()
+            if final_risk.allowed and "intraday_require_cost_cover" in settings.strategy:
+                final_risk = _validate_entry_economics_from_context(
+                    order,
+                    market,
+                    decision,
+                    context,
+                    settings.strategy,
+                    settings.risk,
+                )
             if final_risk.allowed and context and "intraday_max_bar_age_seconds" in settings.strategy:
                 # Only bars closed when the decision started informed its signal.
                 # A raw still-open bar cannot become new evidence while reads retry.

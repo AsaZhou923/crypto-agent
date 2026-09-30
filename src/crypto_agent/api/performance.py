@@ -237,9 +237,7 @@ def load_performance(broker, now, tracking_start=None):
     # Cash journals remain checked by the exact-window audit and ALL cashflow.
     seen = {a["id"] for a in activities}
     for activity in read_activities(broker, start - timedelta(days=2), now + timedelta(days=2)):
-        if activity["id"] not in seen and activity.get("activity_type") not in INTERNAL | EXTERNAL_CASH | {
-            "JNLC"
-        }:
+        if activity["id"] not in seen and activity.get("activity_type") not in INTERNAL | EXTERNAL_CASH:
             activities.append(activity)
     metrics = {
         "daily": calculate(points, activities, start=midnight, daily=True),

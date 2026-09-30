@@ -220,25 +220,34 @@ class AlpacaPaperBroker:
         # the latest observations in the single requested page.
         end = utcnow()
         start = end - timedelta(minutes=limit * 3)
-        payload = self._request(
-            "GET",
-            "/v1beta3/crypto/us/bars",
-            params={
-                "symbols": symbol,
-                "timeframe": timeframe,
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-                "limit": limit,
-                "sort": "desc",
-            },
-            data=True,
-        )
         try:
-            raw = payload["bars"][symbol]
-            if not isinstance(raw, list) or not raw:
+            raw, page_token, seen_tokens = [], None, set()
+            for _ in range(10):
+                params = {
+                    "symbols": symbol,
+                    "timeframe": timeframe,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "limit": limit,
+                    "sort": "desc",
+                }
+                if page_token:
+                    params["page_token"] = page_token
+                payload = self._request("GET", "/v1beta3/crypto/us/bars", params=params, data=True)
+                page = payload["bars"][symbol]
+                if not isinstance(page, list):
+                    raise ValueError
+                raw.extend(page)
+                page_token = payload.get("next_page_token")
+                if len(raw) >= limit or not page_token:
+                    break
+                if page_token in seen_tokens:
+                    raise ValueError
+                seen_tokens.add(page_token)
+            if not raw:
                 raise ValueError
             bars = []
-            for item in raw:
+            for item in raw[:limit]:
                 opened = decimal(item["o"], "bar open")
                 high = decimal(item["h"], "bar high")
                 low = decimal(item["l"], "bar low")
@@ -439,6 +448,7 @@ def _parse_activity(data: dict) -> Activity:
         qty = decimal(data.get("qty", 0))
         price = decimal(data.get("price", 0))
         fee = None
+        currency = str(data["currency"]).upper() if data.get("currency") else None
         if kind == "FILL":
             if (
                 precision != "instant"
@@ -449,11 +459,15 @@ def _parse_activity(data: dict) -> Activity:
             ):
                 raise ValueError
         elif kind in {"CFEE", "FEE"}:
-            if data.get("net_amount") is not None and decimal(data["net_amount"]) != 0:
-                fee = abs(decimal(data["net_amount"]))
-            elif qty != 0 and price > 0:
+            if qty != 0 and price > 0:
                 fee = abs(qty * price)
-            elif data.get("net_amount") is not None and qty == 0:
+            elif (
+                data.get("net_amount") is not None
+                and decimal(data["net_amount"]) != 0
+                and currency in {None, "USD"}
+            ):
+                fee = abs(decimal(data["net_amount"]))
+            elif data.get("net_amount") is not None and qty == 0 and currency in {None, "USD"}:
                 fee = Decimal(0)
         else:
             raise ValueError
@@ -468,6 +482,7 @@ def _parse_activity(data: dict) -> Activity:
             price,
             fee,
             precision,
+            currency,
         )
     except (KeyError, TypeError, ValueError, AgentError) as exc:
         raise BrokerError("Alpaca returned an invalid activity") from exc

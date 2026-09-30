@@ -433,6 +433,28 @@ def test_trade_filter_defaults_to_none_without_changing_legacy_summary(filtered_
     assert {k: v for k, v in filtered.strategy.items() if k != "intraday_trade_filter"} == original.strategy
 
 
+def test_entry_cost_cover_opt_in_changes_digest_only_when_explicit(filtered_config):
+    original = load_settings(root=filtered_config)
+    update(
+        filtered_config,
+        "strategy.yaml",
+        intraday_trade_filter="confirm2_cooldown30",
+        intraday_require_cost_cover=True,
+        intraday_entry_cooldown_seconds=1800,
+    )
+    filtered = load_settings(root=filtered_config)
+    assert "intraday_require_cost_cover" not in original.summary["strategy"]
+    assert filtered.strategy["intraday_require_cost_cover"] is True
+    assert filtered.strategy["intraday_entry_cooldown_seconds"] == 1800
+    assert filtered.digest != original.digest
+    economic_fields = {
+        "intraday_trade_filter",
+        "intraday_require_cost_cover",
+        "intraday_entry_cooldown_seconds",
+    }
+    assert {k: v for k, v in filtered.strategy.items() if k not in economic_fields} == original.strategy
+
+
 @pytest.mark.parametrize("value", ["unknown", True, False, None, 2, [], {}])
 def test_trade_filter_rejects_invalid_values(filtered_config, value):
     update(filtered_config, "strategy.yaml", intraday_trade_filter=value)
@@ -457,6 +479,87 @@ def test_trade_filter_rejects_mismatched_profile(filtered_config, field, value):
 
 def test_trade_filter_is_paper_only(filtered_config):
     update(filtered_config, "strategy.yaml", intraday_trade_filter="confirm2_cooldown30")
+    with pytest.raises(AgentError, match="Paper-only"):
+        load_settings(root=filtered_config, mode="offline")
+
+
+@pytest.mark.parametrize("value", ["true", 1, None, [], {}])
+def test_entry_cost_cover_rejects_invalid_values(filtered_config, value):
+    update(
+        filtered_config,
+        "strategy.yaml",
+        intraday_trade_filter="confirm2_cooldown30",
+        intraday_require_cost_cover=value,
+        intraday_entry_cooldown_seconds=1800,
+    )
+    with pytest.raises(AgentError, match="intraday_require_cost_cover"):
+        load_settings(root=filtered_config)
+
+
+@pytest.mark.parametrize("value", [59, 3601, "1800", True])
+def test_entry_cooldown_rejects_invalid_values(filtered_config, value):
+    update(
+        filtered_config,
+        "strategy.yaml",
+        intraday_trade_filter="confirm2_cooldown30",
+        intraday_require_cost_cover=True,
+        intraday_entry_cooldown_seconds=value,
+    )
+    with pytest.raises(AgentError, match="intraday_entry_cooldown_seconds"):
+        load_settings(root=filtered_config)
+
+
+def test_entry_cost_cover_requires_entry_cooldown(filtered_config):
+    update(
+        filtered_config,
+        "strategy.yaml",
+        intraday_trade_filter="confirm2_cooldown30",
+        intraday_require_cost_cover=True,
+    )
+    with pytest.raises(AgentError, match="requires intraday_entry_cooldown_seconds"):
+        load_settings(root=filtered_config)
+
+
+def test_entry_cooldown_requires_cost_cover_opt_in(filtered_config):
+    update(
+        filtered_config,
+        "strategy.yaml",
+        intraday_trade_filter="confirm2_cooldown30",
+        intraday_entry_cooldown_seconds=1800,
+    )
+    with pytest.raises(AgentError, match="intraday_entry_cooldown_seconds"):
+        load_settings(root=filtered_config)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("name", "baseline"),
+        ("intraday_probe_profile", "small"),
+        ("intraday_entry_policy", "cost_cover"),
+        ("intraday_trade_filter", "none"),
+    ],
+)
+def test_entry_cost_cover_rejects_mismatched_profile(filtered_config, field, value):
+    values = {
+        "intraday_trade_filter": "confirm2_cooldown30",
+        "intraday_require_cost_cover": True,
+        "intraday_entry_cooldown_seconds": 1800,
+    }
+    values[field] = value
+    update(filtered_config, "strategy.yaml", **values)
+    with pytest.raises(AgentError, match="requires intraday_ai expanded_paper capped_probe"):
+        load_settings(root=filtered_config)
+
+
+def test_entry_cost_cover_is_paper_only(filtered_config):
+    update(
+        filtered_config,
+        "strategy.yaml",
+        intraday_trade_filter="confirm2_cooldown30",
+        intraday_require_cost_cover=True,
+        intraday_entry_cooldown_seconds=1800,
+    )
     with pytest.raises(AgentError, match="Paper-only"):
         load_settings(root=filtered_config, mode="offline")
 

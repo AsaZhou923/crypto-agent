@@ -199,8 +199,32 @@ def validate_intraday_trade_filter(strategy: dict) -> str:
     return trade_filter
 
 
+def validate_intraday_entry_economics(strategy: dict) -> bool:
+    enabled = strategy.get("intraday_require_cost_cover", False)
+    if type(enabled) is not bool:
+        raise AgentError("intraday_require_cost_cover must be a YAML boolean")
+    cooldown = strategy.get("intraday_entry_cooldown_seconds")
+    if cooldown is not None and (type(cooldown) is not int or not 60 <= cooldown <= 3600):
+        raise AgentError("intraday_entry_cooldown_seconds must be an integer in [60, 3600]")
+    if enabled and cooldown is None:
+        raise AgentError("intraday_require_cost_cover requires intraday_entry_cooldown_seconds")
+    if cooldown is not None and not enabled:
+        raise AgentError("intraday_entry_cooldown_seconds requires intraday_require_cost_cover")
+    if enabled and (
+        strategy.get("name") != "intraday_ai"
+        or strategy.get("intraday_probe_profile") != "expanded_paper"
+        or strategy.get("intraday_entry_policy") != "capped_probe"
+        or strategy.get("intraday_trade_filter") != "confirm2_cooldown30"
+    ):
+        raise AgentError(
+            "intraday_require_cost_cover requires intraday_ai expanded_paper capped_probe confirm2_cooldown30"
+        )
+    return enabled
+
+
 def validate_intraday_policy(strategy: dict) -> str:
     validate_intraday_trade_filter(strategy)
+    validate_intraday_entry_economics(strategy)
     policy = strategy.get("intraday_entry_policy")
     if not isinstance(policy, str) or policy not in {"cost_cover", "capped_probe"}:
         raise AgentError("intraday_entry_policy must be cost_cover or capped_probe")
@@ -318,6 +342,8 @@ def load_settings(
             "intraday_probe_cost_budget_usd",
             "intraday_probe_profile",
             "intraday_trade_filter",
+            "intraday_require_cost_cover",
+            "intraday_entry_cooldown_seconds",
         },
     )
     _required(
@@ -346,6 +372,9 @@ def load_settings(
     trade_filter = validate_intraday_trade_filter(strategy)
     if trade_filter != "none" and mode != "paper":
         raise AgentError("intraday_trade_filter is Paper-only")
+    entry_economics = validate_intraday_entry_economics(strategy)
+    if entry_economics and mode != "paper":
+        raise AgentError("intraday_require_cost_cover is Paper-only")
     if strategy["asset_type"] != "crypto":
         raise AgentError("TradingAgents requires explicit crypto mode")
     if strategy["analysis_symbol"] not in {upstream_symbol(value) for value in SUPPORTED_SYMBOLS}:

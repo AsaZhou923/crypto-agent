@@ -85,6 +85,8 @@ Codex `btc-paper` 和每两小时策略优化自动化 `paper` 均为 PAUSED。
 
 ## Codex 两小时策略检查
 
+2026-09-30 的成本覆盖、入场冷却、费用元数据、分页和评估时效改进见 [v5.2 Paper 优化](paper-v5.2-economic-optimization.md)。新策略效果需要后续独立数据验证。
+
 `crypto-agent-strategy-review.timer` 在 JST 双数小时的 20 分触发 `crypto-agent-strategy-review.service`，不会补跑错过的时间。服务以 optiplex 用户启动本机已经登录的 Codex CLI，用官方 `codex exec --sandbox read-only` 模式检查服务器的 Paper 账本、策略、风控和调度证据。[Codex 非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)支持在脚本和计划任务中运行，并默认只读。
 
 提示词和 JSON 报告格式分别保存在 `deploy/strategy-review.prompt.md` 与 `deploy/strategy-review.schema.json`。每次完整报告存入 `runtime/hourly-strategy-review/<UTC时间>/report.json`，最近报告写入 `server-review-latest.json`；`attention/blocked` 结果仅保存在服务器，不发送 Telegram 通知。Codex 调用有 25 分钟超时，systemd 总超时 30 分钟；失败写入该次目录的 `failure.json` 并返回失败状态，同样不发送 Telegram 通知。定时器不执行 `auto-tick` 或修改生产文件。

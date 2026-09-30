@@ -318,6 +318,19 @@ def test_expanded_trade_filter_has_distinct_version(config, risk, trade_filter, 
     assert strategy.config == settings
 
 
+def test_expanded_cost_cover_guard_has_distinct_version(config, risk):
+    settings = probe_config(
+        config,
+        intraday_probe_profile="expanded_paper",
+        intraday_trade_filter="confirm2_cooldown30",
+        intraday_require_cost_cover=True,
+        intraday_entry_cooldown_seconds=1800,
+    )
+    strategy = IntradayAIStrategy(settings, risk)
+    assert strategy.version == "intraday-ai-1min-v5.2-economic-low-turnover-paper"
+    assert strategy.require_entry_cost_cover is True
+
+
 @pytest.mark.parametrize("value", [True, False, None, "unknown", [], {}])
 def test_direct_strategy_rejects_invalid_trade_filter(config, risk, value):
     with pytest.raises(AgentError, match="intraday_trade_filter"):
@@ -389,3 +402,56 @@ def test_probe_guard_counts_holdings_and_rechecks_spread(config, market, portfol
     wider = replace(market, bid=D("100.30"))
     assert not validate_intraday_order(order, wider, held, settings, costs).allowed
     assert validate_intraday_order(replace(order, side="sell"), wider, held, settings, costs).allowed
+
+
+def test_probe_cost_cover_opt_in_blocks_low_bps_signal(config, market, portfolio):
+    portfolio = replace(portfolio, equity_usd=D(100000), cash_usd=D(100000))
+    costs = {"fee_buffer_bps": D(30), "slippage_bps": D(20)}
+    settings = probe_config(
+        config,
+        intraday_probe_profile="expanded_paper",
+        intraday_trade_filter="confirm2_cooldown30",
+        intraday_require_cost_cover=True,
+        intraday_entry_cooldown_seconds=1800,
+    )
+    strategy = IntradayAIStrategy(settings, costs)
+    features = strategy._features(market, bars(), now=NOW)
+    decision = strategy.parse_output(output(), market, portfolio, features, NOW, now=NOW)
+    assert decision.rating == "REVIEW"
+    assert not decision.actionable
+    assert "round-trip cost" in decision.evidence[0]
+
+
+def test_entry_economics_failure_reasons_are_tuple(config, market, portfolio):
+    from crypto_agent.models import OrderIntent, TradeDecision
+    from crypto_agent.risk.intraday import validate_entry_economics
+
+    settings = probe_config(
+        config,
+        intraday_probe_profile="expanded_paper",
+        intraday_trade_filter="confirm2_cooldown30",
+        intraday_require_cost_cover=True,
+        intraday_entry_cooldown_seconds=1800,
+        intraday_lookback_bars=60,
+        intraday_min_bars=45,
+        intraday_max_bar_age_seconds=180,
+        intraday_momentum_threshold_bps=D(2),
+    )
+    order = OrderIntent("BTC/USD", "buy", D(".01"), "economics", D("100.61"), D(1), D(".003"))
+    decision = TradeDecision(
+        "BTC/USD",
+        D(".01"),
+        "test",
+        NOW + timedelta(seconds=120),
+        NOW,
+        "Buy",
+        "v5.2",
+        "test",
+        ("test",),
+    )
+    result = validate_entry_economics(
+        order, market, decision, (), settings, {"fee_buffer_bps": D(30), "slippage_bps": D(20)}
+    )
+    assert not result.allowed
+    assert isinstance(result.reasons, tuple)
+    assert result.reasons == ("Intraday minute bars are missing",)

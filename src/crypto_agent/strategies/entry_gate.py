@@ -151,6 +151,12 @@ def _entry_barrier(database, settings, current, decision, quote, now):
         ORDER BY sequence DESC LIMIT 1""",
         (settings.digest, decision.symbol, current["sequence"]),
     ).fetchone()
+    admitted = database.connection.execute(
+        """SELECT * FROM entry_filter_signals WHERE config_digest=? AND symbol=? AND sequence<?
+        AND admitted=1 AND valid=1 AND rating IN ('Buy','Overweight')
+        ORDER BY sequence DESC LIMIT 1""",
+        (settings.digest, decision.symbol, current["sequence"]),
+    ).fetchone()
     reductions = database.connection.execute(
         """SELECT * FROM entry_filter_signals WHERE config_digest=? AND symbol=? AND sequence<?
         AND valid=1 AND rating IN ('Sell','Underweight')""",
@@ -160,6 +166,14 @@ def _entry_barrier(database, settings, current, decision, quote, now):
     reduction_times = [_history(row, **history_options)[2] for row in reductions]
     if reduction_times and now - max(reduction_times) < timedelta(minutes=30):
         return "wait 30 minutes after the latest reduction signal"
+    if settings.strategy.get("intraday_require_cost_cover", False) is True and admitted is not None:
+        admitted_history = _history(admitted, **history_options)
+        cooldown_seconds = settings.strategy["intraday_entry_cooldown_seconds"]
+        cooldown = timedelta(seconds=cooldown_seconds)
+        if admitted_history is not None and now - admitted_history[2] < cooldown:
+            minutes = cooldown_seconds // 60
+            unit = "minute" if minutes == 1 else "minutes"
+            return f"wait {minutes} {unit} after the latest admitted bullish entry"
     evidence = _history(previous, **history_options) if previous else None
     cycle = timestamp(current["cycle_started_at"]) if current["cycle_started_at"] else None
     confirmed = (

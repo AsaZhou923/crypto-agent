@@ -61,6 +61,9 @@ export type Ledger = {
     id: string;
     order_id: string | null;
     amount: string | null;
+    currency?: string | null;
+    symbol?: string | null;
+    attribution?: string;
     occurred_at: string;
   }[];
   notice: string;

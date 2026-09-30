@@ -74,6 +74,13 @@ class Automation:
     def symbols_per_cycle(self) -> int:
         return self.settings.paper.get("automatic_symbols_per_cycle", 1)
 
+    @property
+    def evaluation_gap_seconds(self) -> int:
+        rotations = (
+            len(self.settings.paper["symbols"]) + self.symbols_per_cycle - 1
+        ) // self.symbols_per_cycle
+        return self.interval_seconds * (rotations + 1)
+
     def _state(self) -> dict:
         body = self.db.metadata("automatic_policy")
         return json.loads(body) if body else {"enabled": False}
@@ -91,26 +98,32 @@ class Automation:
         ).fetchone()
         count = self.db.connection.execute("SELECT count(*) FROM strategy_observations").fetchone()[0]
         counts_by_symbol = {symbol: 0 for symbol in self.settings.paper["symbols"]}
-        for observation in self.db.connection.execute("SELECT body FROM strategy_observations"):
-            body = json.loads(observation[0])
+        observations = []
+        for observation in self.db.connection.execute(
+            "SELECT id,body FROM strategy_observations ORDER BY id"
+        ):
+            body = json.loads(observation["body"])
+            observations.append((observation["id"], body))
             symbol = body.get("symbol", "BTC/USD")
             if body.get("config_digest") == self.settings.digest and symbol in counts_by_symbol:
                 counts_by_symbol[symbol] += 1
-        evaluations = self.db.connection.execute(
-            "SELECT body FROM strategy_evaluations ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+        diagnostics = self._evaluation_diagnostics(observations)
+        last_evaluation, last_by_symbol = self._last_evaluations(diagnostics)
         return {
             "enabled": state.get("enabled", False) and not self.pause_path.exists(),
             "mode": self.settings.mode,
             "interval_seconds": self.interval_seconds,
             "symbols_per_cycle": self.symbols_per_cycle,
+            "evaluation_gap_seconds": self.evaluation_gap_seconds,
             "state": state,
             "kill_switch_present": self.pause_path.exists(),
             "last_cycle": dict(row) if row else None,
             "observation_count": count,
             "observation_count_by_symbol": counts_by_symbol,
             "minimum_evaluation_samples": MINIMUM_EVALUATION_SAMPLES,
-            "last_evaluation": json.loads(evaluations[0]) if evaluations else None,
+            "last_evaluation": last_evaluation,
+            "last_evaluation_by_symbol": last_by_symbol,
+            "evaluation_diagnostics_by_symbol": diagnostics,
         }
 
     def enable(self, *, explicit: bool = False) -> dict:
@@ -484,10 +497,21 @@ class Automation:
         from crypto_agent.evaluation import Observation, evaluate_candidates
 
         observations = []
+        bodies = []
         try:
             for row in rows:
                 item = json.loads(row["body"])
+                bodies.append(item)
                 observations.append(Observation(**item))
+            freshness = self._current_evaluation_freshness(
+                bodies, enforce_stale=bool(self._state().get("last_started_at"))
+            )
+            if freshness is not None:
+                return freshness | {
+                    "new_samples": len(rows),
+                    "required_samples": MINIMUM_EVALUATION_SAMPLES,
+                    "holdout_evaluated": False,
+                }
             if (
                 observations[-1].config_digest != self.settings.digest
                 or observations[-1].mode != self.settings.mode
@@ -508,12 +532,7 @@ class Automation:
                     if self.settings.strategy.get("intraday_entry_policy") == "capped_probe"
                     else None,
                     min_interval_seconds=self.interval_seconds,
-                    max_gap_seconds=self.interval_seconds
-                    * (
-                        (len(self.settings.paper["symbols"]) + self.symbols_per_cycle - 1)
-                        // self.symbols_per_cycle
-                        + 1
-                    ),
+                    max_gap_seconds=self.evaluation_gap_seconds,
                 )
         except (TypeError, ValueError, AttributeError):
             evaluated = {
@@ -522,9 +541,15 @@ class Automation:
                 "reason": "Malformed observation; no policy change or holdout consumption",
             }
         selected_start = int(evaluated.get("excluded_prefix_count", 0))
+        if selected_start < 0 or selected_start >= len(rows):
+            raise AgentError("Evaluation selected an invalid observation window")
         selected_first_id = rows[selected_start]["id"]
+        selected_count = int(evaluated.get("observation_count", len(rows) - selected_start))
+        if selected_count < 0 or selected_count > len(rows) - selected_start:
+            raise AgentError("Evaluation selected an invalid observation count")
         evaluated.update(
-            new_samples=len(rows),
+            new_samples=selected_count,
+            total_new_samples=len(rows),
             required_samples=MINIMUM_EVALUATION_SAMPLES,
             selected_first_observation_id=selected_first_id,
             selected_last_observation_id=rows[-1]["id"],
@@ -534,7 +559,7 @@ class Automation:
         if candidate not in ALLOWED_MULTIPLIERS or candidate > decimal(state["current_multiplier"]):
             raise AgentError("Evaluation proposed a forbidden exposure increase")
         holdout_evaluated = evaluated.get("holdout_evaluated") is True
-        if holdout_evaluated and len(rows) < MINIMUM_EVALUATION_SAMPLES:
+        if holdout_evaluated and selected_count < MINIMUM_EVALUATION_SAMPLES:
             raise AgentError("Evaluation cannot examine a holdout below the sample gate")
         if evaluated.get("status") == "promote" and not holdout_evaluated:
             raise AgentError("Evaluation cannot promote without an examined holdout")
@@ -555,6 +580,137 @@ class Automation:
                 "INSERT OR REPLACE INTO metadata VALUES ('automatic_policy',?)", (dumps(state),)
             )
         return evaluated
+
+    def _last_evaluations(self, diagnostics: dict) -> tuple[dict | None, dict]:
+        overall = None
+        by_symbol = {}
+        wanted = set(self.settings.paper["symbols"])
+        for row in self.db.connection.execute(
+            "SELECT id,evaluated_at,first_observation_id,last_observation_id,body "
+            "FROM strategy_evaluations ORDER BY id DESC"
+        ):
+            body = json.loads(row["body"])
+            cohort = body.get("cohort") or {}
+            evaluation = self._decorate_evaluation(row, body, diagnostics)
+            if overall is None:
+                overall = evaluation
+            symbol = cohort.get("symbol")
+            if symbol in wanted and symbol not in by_symbol:
+                by_symbol[symbol] = evaluation
+                if len(by_symbol) == len(wanted) and overall is not None:
+                    break
+        return overall, by_symbol
+
+    def _decorate_evaluation(self, row, body: dict, diagnostics: dict) -> dict:
+        return {
+            **body,
+            "audit": {
+                "id": row["id"],
+                "evaluated_at": row["evaluated_at"],
+                "first_observation_id": row["first_observation_id"],
+                "last_observation_id": row["last_observation_id"],
+            },
+            "current_status": self._evaluation_body_status(body, diagnostics),
+        }
+
+    def _evaluation_body_status(self, body: dict, diagnostics: dict) -> dict:
+        cohort = body.get("cohort") or {}
+        symbol = cohort.get("symbol")
+        if symbol not in self.settings.paper["symbols"]:
+            return {"status": "historical", "reason": "Evaluation has no current configured symbol"}
+        if cohort.get("config_digest") != self.settings.digest or cohort.get("mode") != self.settings.mode:
+            return {"status": "historical", "reason": "Evaluation used a different configuration or mode"}
+        diagnostic = diagnostics[symbol]
+        if diagnostic["status"] != "current":
+            return diagnostic
+        last_id = body.get("selected_last_observation_id")
+        if last_id is not None and last_id != diagnostic.get("latest_observation_id"):
+            return {
+                **diagnostic,
+                "status": "historical",
+                "reason": "Evaluation does not include the latest current observation",
+            }
+        return diagnostic
+
+    def _evaluation_diagnostics(self, observations: list[tuple[int, dict]]) -> dict:
+        state = self._state()
+        cursors = dict(state.get("evaluation_cursors", {}))
+        result = {}
+        for symbol in self.settings.paper["symbols"]:
+            cursor = int(cursors.get(symbol, state.get("evaluation_cursor", 0) if symbol == "BTC/USD" else 0))
+            raw_count = 0
+            current_config_count = 0
+            latest = None
+            latest_id = None
+            for row_id, body in observations:
+                if body.get("symbol", "BTC/USD") != symbol:
+                    continue
+                if row_id > cursor:
+                    raw_count += 1
+                    if (
+                        body.get("config_digest") == self.settings.digest
+                        and body.get("mode") == self.settings.mode
+                    ):
+                        current_config_count += 1
+                if (
+                    body.get("config_digest") == self.settings.digest
+                    and body.get("mode") == self.settings.mode
+                ):
+                    latest = body
+                    latest_id = row_id
+            diagnostic = {
+                "status": "insufficient_evidence",
+                "symbol": symbol,
+                "raw_new_observations": raw_count,
+                "current_config_observations": current_config_count,
+                "required_samples": MINIMUM_EVALUATION_SAMPLES,
+                "cursor": cursor,
+                "max_gap_seconds": self.evaluation_gap_seconds,
+                "latest_observation_id": latest_id,
+                "latest_observation_available_at": latest.get("available_at") if latest else None,
+            }
+            if latest is None:
+                diagnostic["reason"] = "No current-configuration observations after the evaluation cursor"
+            elif freshness := self._current_evaluation_freshness([latest], enforce_stale=True):
+                diagnostic.update(freshness)
+            else:
+                diagnostic["status"] = "current"
+                diagnostic["reason"] = "Latest current-configuration observation is fresh"
+            result[symbol] = diagnostic
+        return result
+
+    def _current_evaluation_freshness(self, observations: list[dict], *, enforce_stale: bool) -> dict | None:
+        state = self._state()
+        now = utcnow()
+        try:
+            latest_available_at = timestamp(observations[-1]["available_at"])
+        except (KeyError, TypeError, ValueError, AgentError):
+            return {
+                "status": "invalid_evidence",
+                "reason": "Malformed observation freshness; no policy change or holdout consumption",
+                "latest_observation_available_at": None,
+                "current_cycle_started_at": state.get("last_started_at"),
+            }
+        age = (now - latest_available_at).total_seconds()
+        if age < 0:
+            return {
+                "status": "invalid_evidence",
+                "reason": "Latest optimization evidence is from the future",
+                "latest_observation_available_at": latest_available_at.isoformat(),
+                "current_cycle_started_at": state.get("last_started_at"),
+                "age_seconds": age,
+                "max_gap_seconds": self.evaluation_gap_seconds,
+            }
+        if enforce_stale and age > self.evaluation_gap_seconds:
+            return {
+                "status": "insufficient_evidence",
+                "reason": "Latest optimization evidence is stale; waiting for a fresh eligible observation",
+                "latest_observation_available_at": latest_available_at.isoformat(),
+                "current_cycle_started_at": state.get("last_started_at"),
+                "age_seconds": age,
+                "max_gap_seconds": self.evaluation_gap_seconds,
+            }
+        return None
 
 
 class _GuardedBroker:

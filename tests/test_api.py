@@ -183,7 +183,38 @@ def test_paper_queries_only_fixed_origins_get_and_preserve_states():
         if request.url.path == "/v2/orders":
             return httpx.Response(200, json=[order])
         if request.url.path == "/v2/account/activities":
-            return httpx.Response(200, json=[])
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "cash-fee",
+                        "activity_type": "CFEE",
+                        "date": "2026-09-19",
+                        "net_amount": "-1.23",
+                        "currency": "USD",
+                    },
+                    {
+                        "id": "asset-fee",
+                        "activity_type": "CFEE",
+                        "date": "2026-09-19",
+                        "net_amount": "0",
+                        "currency": "USD",
+                        "symbol": "BTCUSD",
+                        "qty": "-0.00001",
+                        "price": "50000",
+                    },
+                    {
+                        "id": "fee-credit",
+                        "activity_type": "CFEE",
+                        "date": "2026-09-19",
+                        "net_amount": "0",
+                        "currency": "USD",
+                        "symbol": "BTCUSD",
+                        "qty": "0.00001",
+                        "price": "50000",
+                    },
+                ],
+            )
         if request.url.path.endswith("/bars"):
             return httpx.Response(
                 200,
@@ -210,6 +241,13 @@ def test_paper_queries_only_fixed_origins_get_and_preserve_states():
     assert ledger["orders"][0]["submitted_at"] == "2026-09-19T10:00:01Z"
     assert ledger["orders"][0]["status"] == "partially_filled"
     assert ledger["orders"][0]["run_id"] is None
+    assert ledger["fees"][0]["currency"] == "USD"
+    assert ledger["fees"][0]["symbol"] is None
+    assert ledger["fees"][0]["attribution"] == "USD fee / coin attribution unavailable"
+    assert ledger["fees"][1]["symbol"] == "BTC/USD"
+    assert ledger["fees"][1]["attribution"] == "asset fee attributed to symbol"
+    assert ledger["fees"][2]["symbol"] == "BTC/USD"
+    assert ledger["fees"][2]["attribution"] == "USD fee / coin attribution unavailable"
     assert monitor.market("5Min")["data"]["timeframe"] == "5Min"
     assert all(r.method == "GET" for r in requests)
     assert all(r.url.host in {"paper-api.alpaca.markets", "data.alpaca.markets"} for r in requests)

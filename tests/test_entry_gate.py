@@ -140,6 +140,37 @@ def test_latest_reduction_restarts_cooldown(setup):
     assert observe(setup, 1800)[0].rating == "REVIEW"
 
 
+def test_entry_cost_cover_opt_in_cools_down_after_admitted_bullish_entry(setup):
+    settings, db = setup
+    settings = replace(
+        settings,
+        strategy={
+            **settings.strategy,
+            "intraday_require_cost_cover": True,
+            "intraday_entry_cooldown_seconds": 1800,
+        },
+    )
+    first, _ = observe((settings, db), 0)
+    second, raw = observe((settings, db), 300)
+    assert first.rating == "REVIEW"
+    assert second == raw
+    third, _ = observe((settings, db), 600)
+    assert third.rating == "REVIEW"
+    assert "wait 30 minutes after the latest admitted bullish entry" in third.reason
+    fourth, _ = observe((settings, db), 1800)
+    assert fourth.rating == "REVIEW"
+    fifth, raw = observe((settings, db), 2100)
+    assert fifth == raw
+
+
+def test_legacy_trade_filter_does_not_cool_down_after_admitted_bullish_entry(setup):
+    observe(setup, 0)
+    second, raw = observe(setup, 300)
+    assert second == raw
+    third, raw = observe(setup, 600)
+    assert third == raw
+
+
 def test_restart_retains_confirmation(setup):
     settings, db = setup
     observe(setup, 0)

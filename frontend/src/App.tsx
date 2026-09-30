@@ -694,7 +694,15 @@ function Details({
           </summary>
           {data.ledger.data.fees.map((f) => (
             <p key={f.id}>
-              {activityTime(f.occurred_at)} · {money(f.amount)} ·{" "}
+              {activityTime(f.occurred_at)} · {f.symbol || "交易对未提供"} ·{" "}
+              {f.attribution === "asset fee attributed to symbol"
+                ? "扣币手续费"
+                : f.currency === "USD"
+                  ? "USD 现金手续费"
+                  : f.currency
+                    ? `${f.currency} 手续费`
+                    : "费用币种未提供"} · 折合{" "}
+              {money(f.amount)} ·{" "}
               {f.order_id || "平台未提供关联订单"}
             </p>
           ))}
