@@ -792,6 +792,50 @@ def test_unknown_risk_block_still_counts_as_failure(setup, monkeypatch):
     assert result["automatic_paused"] is True
 
 
+def test_preview_stage_mixed_risk_reasons_still_count_as_failure(setup, monkeypatch):
+    from crypto_agent.models import RiskResult
+
+    settings, _, broker, automation = setup
+    now = utcnow()
+    monkeypatch.setattr(automation_module, "utcnow", lambda: now)
+    automation.enable(explicit=True)
+
+    def blocked_before_order(*args, **kwargs):
+        return {
+            "status": "blocked",
+            "run_id": "preview-mixed-risk",
+            "risk": RiskResult(False, ("Market data is stale", "Daily loss limit reached")),
+        }
+
+    monkeypatch.setattr(automation_module, "run_once", blocked_before_order)
+    result = automation.tick(broker, explicit=True, strategy=rating_strategy(settings, "Buy"))
+    assert "ordinary_pre_submit_skip" not in result
+    assert result["automatic_paused"] is True
+    assert not automation.status()["enabled"]
+
+
+def test_execution_stage_missing_order_row_cannot_be_ordinary_skip(setup, monkeypatch):
+    from crypto_agent.models import RiskResult
+
+    settings, db, broker, automation = setup
+    now = utcnow()
+    monkeypatch.setattr(automation_module, "utcnow", lambda: now)
+    automation.enable(explicit=True)
+    monkeypatch.setattr(
+        automation_module,
+        "execute_preview",
+        lambda *args, **kwargs: {"status": "blocked", "risk": RiskResult(False, ("Market data is stale",))},
+    )
+    monkeypatch.setattr(db, "order_for_run", Mock(return_value=None))
+    for index in range(3):
+        result = automation.tick(broker, explicit=True, strategy=rating_strategy(settings, "Buy"))
+        assert "ordinary_pre_submit_skip" not in result
+        assert automation._state()["failure_count"] == index + 1
+        now += timedelta(seconds=600)
+    assert result["automatic_paused"] is True
+    assert not automation.status()["enabled"]
+
+
 @pytest.mark.parametrize("field,value", [("config_digest", "unapproved"), ("mode", "paper")])
 def test_latest_evidence_must_match_approved_configuration_and_mode(setup, monkeypatch, field, value):
     _, db, broker, automation = setup
@@ -982,6 +1026,51 @@ def test_dual_round_claims_one_slot_and_preserves_cadence_after_restart(dual_set
         assert restarted.tick(broker, explicit=True, strategy=strategy)["status"] == "cooldown"
     finally:
         other_db.close()
+
+
+def test_dual_xrp_preview_stale_blocks_do_not_halt_or_step_past_symbol(dual_setup, monkeypatch):
+    from crypto_agent.models import RiskResult
+
+    settings, db, broker, automation, strategy = dual_setup
+    now = utcnow()
+    monkeypatch.setattr(automation_module, "utcnow", lambda: now)
+    automation.enable(explicit=True)
+    original_run_once = automation_module.run_once
+    stale_runs = []
+
+    def block_xrp(
+        settings, guarded, database, analysis_only=False, strategy=None, symbol=None, cycle_started_at=None
+    ):
+        if symbol == "XRP/USD":
+            run_id = f"xrp-stale-{len(stale_runs)}"
+            stale_runs.append(run_id)
+            return {
+                "status": "blocked",
+                "run_id": run_id,
+                "risk": RiskResult(False, ("Market data is stale",)),
+            }
+        return original_run_once(
+            settings,
+            guarded,
+            database,
+            analysis_only=analysis_only,
+            strategy=strategy,
+            symbol=symbol,
+            cycle_started_at=cycle_started_at,
+        )
+
+    monkeypatch.setattr(automation_module, "run_once", block_xrp)
+    for _ in range(3):
+        result = automation.tick(broker, explicit=True, strategy=strategy)
+        assert result["status"] == "blocked", result
+        assert [item["symbol"] for item in result["results"]] == ["BTC/USD", "XRP/USD"]
+        assert result["skipped_symbols"] == []
+        assert result["results"][1]["ordinary_pre_submit_skip"] is True
+        assert automation._state()["failure_count"] == 0
+        assert automation.status()["enabled"]
+        now += timedelta(seconds=300)
+    assert stale_runs == ["xrp-stale-0", "xrp-stale-1", "xrp-stale-2"]
+    assert not db.orders(attempted_only=True)
 
 
 def test_cycle_lock_covers_both_symbols_even_when_round_exceeds_interval(dual_setup, monkeypatch):

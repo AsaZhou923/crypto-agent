@@ -386,18 +386,12 @@ class Automation:
                     result["automatic_paused"] = True
             result["optimization"] = self._evaluate(guarded.get_asset_rules(selected_symbol))
             result["report"] = self.db.report()
-            ordinary_skip = False
-            if result["status"] == "blocked" and "execution" in result:
-                row = self.db.order_for_run(preview["run_id"])
-                risk = result["execution"].get("risk")
-                ordinary_skip = bool(
-                    row
-                    and row["attempted"] == 0
-                    and risk
-                    and risk.reasons
-                    and set(risk.reasons) <= ORDINARY_PRE_SUBMIT_REASONS
-                )
-            if ordinary_skip:
+            has_execution = "execution" in result
+            if result["status"] == "blocked" and self._ordinary_pre_submit_skip(
+                preview["run_id"],
+                result.get("execution", {}).get("risk") or preview.get("risk"),
+                allow_no_order=not has_execution,
+            ):
                 result["ordinary_pre_submit_skip"] = True
             return result
         except (BrokerRateLimited, BrokerReadUnavailable) as exc:
@@ -441,6 +435,13 @@ class Automation:
                 return {"status": "halted", "reason": "unknown_order", "automatic_paused": True}
             # No exception text from third-party SDKs or model clients is persisted.
             return {"status": "failed", "reason": "Unexpected cycle failure; reconciliation required"}
+
+    def _ordinary_pre_submit_skip(self, run_id: str, risk, *, allow_no_order: bool = False) -> bool:
+        reasons = getattr(risk, "reasons", ())
+        if not reasons or set(reasons) - ORDINARY_PRE_SUBMIT_REASONS:
+            return False
+        row = self.db.order_for_run(run_id)
+        return row["attempted"] == 0 if row else allow_no_order
 
     def _record_observation(self, preview: dict, available_at):
         decision = self.db.get_run(preview["run_id"])["decision"]
