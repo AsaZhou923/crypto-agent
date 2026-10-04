@@ -81,6 +81,7 @@ class Monitor:
                         timeout_seconds=self.settings.paper["request_timeout_seconds"],
                         allow_submit=False,
                         symbols=tuple(self.settings.paper["symbols"]),
+                        bar_source=self.settings.strategy.get("intraday_bar_source", "alpaca_crypto_us"),
                     )
             except AgentError as exc:
                 self.config_error = str(exc)

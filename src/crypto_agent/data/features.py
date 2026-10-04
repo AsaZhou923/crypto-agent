@@ -35,6 +35,7 @@ class IntradayFeatures:
     range_20m_bps: Decimal
     recent_volume_ratio: Decimal | None
     momentum_score: int
+    source: str
 
     def payload(self) -> dict:
         return asdict(self)
@@ -69,6 +70,8 @@ def build_intraday_features(
     max_age_seconds: int,
     momentum_threshold_bps: Decimal,
     now: datetime | None = None,
+    expected_source: str | None = None,
+    max_quote_bar_deviation_bps: Decimal | None = None,
 ) -> IntradayFeatures:
     """Validate closed 1-minute bars and compute a small auditable feature set."""
     now = timestamp(now or utcnow())
@@ -110,6 +113,8 @@ def build_intraday_features(
             validated.append(bar)
     if len(sources) != 1:
         raise AgentError("Intraday bars mix data sources")
+    if expected_source is not None and sources != {expected_source}:
+        raise AgentError("Intraday bars do not match configured source")
     validated.sort(key=lambda bar: bar.observed_at)
     if len({bar.observed_at for bar in validated}) != len(validated):
         raise AgentError("Intraday bars contain duplicate timestamps")
@@ -128,6 +133,12 @@ def build_intraday_features(
         raise AgentError("Intraday minute bars are stale")
 
     closes = [bar.close for bar in validated]
+    if max_quote_bar_deviation_bps is not None:
+        deviation_limit = decimal(max_quote_bar_deviation_bps)
+        if not 1 <= deviation_limit <= 100:
+            raise AgentError("Invalid cross-venue price deviation limit")
+        if abs(market.price / closes[-1] - 1) * BPS > deviation_limit:
+            raise AgentError("Execution quote diverges from analysis candles beyond configured limit")
     return_3m = _return_bps(closes, 3)
     return_10m = _return_bps(closes, 10)
     return_30m = _return_bps(closes, 30)
@@ -169,4 +180,5 @@ def build_intraday_features(
         range_20m_bps=price_range,
         recent_volume_ratio=volume_ratio,
         momentum_score=score,
+        source=validated[-1].source,
     )

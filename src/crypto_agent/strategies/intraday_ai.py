@@ -147,6 +147,10 @@ class IntradayAIStrategy:
             min_bars=self.config["intraday_min_bars"],
             max_age_seconds=self.config["intraday_max_bar_age_seconds"],
             momentum_threshold_bps=self.momentum_threshold,
+            expected_source="coinbase-exchange-1min-bars"
+            if self.config.get("intraday_bar_source") == "coinbase_exchange"
+            else None,
+            max_quote_bar_deviation_bps=self.config.get("intraday_max_quote_bar_deviation_bps"),
             now=now,
         )
 
@@ -244,6 +248,7 @@ class IntradayAIStrategy:
                 )
         gross_move_bps, round_trip_cost_bps = self._entry_costs(market, features)
         feature_evidence = (
+            f"Analysis candle source {features.source}; execution quote source {market.source}",
             f"Closed 1-minute bars {features.bar_count}, last start {features.last_bar_at.isoformat()}",
             f"Returns bps 3m={features.return_3m_bps}, 10m={features.return_10m_bps}, "
             f"30m={features.return_30m_bps}; EMA5/20={features.ema_5_vs_20_bps}; score={features.momentum_score}",

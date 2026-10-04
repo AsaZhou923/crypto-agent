@@ -44,6 +44,7 @@ def make_broker(settings: Settings, allow_submit: bool = False):
         timeout_seconds=settings.paper["request_timeout_seconds"],
         allow_submit=allow_submit,
         symbols=tuple(settings.paper["symbols"]),
+        bar_source=settings.strategy.get("intraday_bar_source", "alpaca_crypto_us"),
     )
 
 

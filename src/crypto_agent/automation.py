@@ -277,9 +277,12 @@ class Automation:
             if self.symbols_per_cycle > 1:
                 result.setdefault("symbol", selected_symbol)
             results.append(result)
-            # A submitted-but-unfinished order, any risk block, or a fault ends
-            # the round. The next symbol never retries or bypasses that outcome.
-            if result["status"] not in {"filled", "no_order"} or self.pause_path.exists():
+            # Only an unsubmitted, symbol-local stale quote can skip ahead.
+            # Pending submissions, account risk, pauses and faults end the round.
+            if (
+                result["status"] not in {"filled", "no_order"}
+                and not result.get("symbol_data_unavailable", False)
+            ) or self.pause_path.exists():
                 break
         result = results[-1]
         failure = any(
@@ -289,6 +292,8 @@ class Automation:
         )
         if self.symbols_per_cycle > 1:
             status = result["status"]
+            if any(item["status"] == "blocked" for item in results) and status in {"filled", "no_order"}:
+                status = "blocked"
             if all(item["status"] in {"filled", "no_order"} for item in results):
                 status = "filled" if any(item["status"] == "filled" for item in results) else "no_order"
             result = {
@@ -393,6 +398,12 @@ class Automation:
                 allow_no_order=not has_execution,
             ):
                 result["ordinary_pre_submit_skip"] = True
+                if (
+                    not has_execution
+                    and self.db.order_for_run(preview["run_id"]) is None
+                    and set(getattr(preview.get("risk"), "reasons", ())) == {"Market data is stale"}
+                ):
+                    result["symbol_data_unavailable"] = True
             return result
         except (BrokerRateLimited, BrokerReadUnavailable) as exc:
             # A GET can be deferred, but it cannot resolve a potentially accepted POST.

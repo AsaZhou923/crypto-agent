@@ -97,6 +97,7 @@ class AlpacaPaperBroker:
         symbols: tuple[str, ...] = (SYMBOL,),
         *,
         transport: httpx.BaseTransport | None = None,
+        bar_source: str = "alpaca_crypto_us",
     ):
         # Reject paths, query strings, credentials, ports and lookalike hosts.
         if base_url.rstrip("/") != PAPER_URL:
@@ -107,6 +108,13 @@ class AlpacaPaperBroker:
             raise BrokerError("Broker request timeout must be in (0, 120] seconds")
         self.base_url = PAPER_URL
         self.allow_submit = allow_submit
+        if bar_source not in {"alpaca_crypto_us", "coinbase_exchange"}:
+            raise BrokerError("Unsupported intraday bar source")
+        self._bar_provider = None
+        if bar_source == "coinbase_exchange":
+            from crypto_agent.data.coinbase import CoinbaseMinuteBars
+
+            self._bar_provider = CoinbaseMinuteBars(timeout_seconds)
         self.symbols = tuple(normalize_symbol(symbol) for symbol in symbols)
         if not 1 <= len(self.symbols) <= 3 or len(set(self.symbols)) != len(self.symbols):
             raise BrokerError("Broker requires one to three distinct supported symbols")
@@ -216,6 +224,8 @@ class AlpacaPaperBroker:
             raise BrokerError("Bar request is outside the configured broker universe")
         if timeframe != "1Min" or type(limit) is not int or not 30 <= limit <= 240:
             raise BrokerError("Intraday bars require timeframe 1Min and limit in [30, 240]")
+        if self._bar_provider is not None:
+            return self._bar_provider.get_bars(symbol, timeframe=timeframe, limit=limit)
         # A bounded start protects against a sparse page while ``sort=desc`` keeps
         # the latest observations in the single requested page.
         end = utcnow()
@@ -434,6 +444,8 @@ class AlpacaPaperBroker:
 
     def close(self) -> None:
         self._client.close()
+        if self._bar_provider is not None:
+            self._bar_provider.close()
 
 
 def _parse_activity(data: dict) -> Activity:

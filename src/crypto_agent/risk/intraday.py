@@ -62,6 +62,10 @@ def validate_entry_economics(order, market, decision, bars, strategy, risk) -> R
                 strategy["intraday_momentum_threshold_bps"], "intraday momentum threshold"
             ),
             now=decision.created_at,
+            expected_source="coinbase-exchange-1min-bars"
+            if strategy.get("intraday_bar_source") == "coinbase_exchange"
+            else None,
+            max_quote_bar_deviation_bps=strategy.get("intraday_max_quote_bar_deviation_bps"),
         )
         gross_move_bps = max(
             Decimal(0),

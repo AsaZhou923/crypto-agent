@@ -1190,6 +1190,30 @@ def test_pause_between_symbols_prevents_second_analysis(dual_setup, monkeypatch)
     assert strategy.decide.call_count == 1
 
 
+def test_stale_first_symbol_skips_only_that_symbol_without_submission(dual_setup):
+    _, db, broker, automation, strategy = dual_setup
+    market = broker.get_markets
+
+    def stale_btc(symbols):
+        values = market(symbols)
+        if "BTC/USD" in values:
+            values["BTC/USD"] = replace(values["BTC/USD"], observed_at=utcnow() - timedelta(minutes=5))
+        return values
+
+    broker.get_markets = stale_btc
+    broker.submit_order = Mock(wraps=broker.submit_order)
+    automation.enable(explicit=True)
+    result = automation.tick(broker, explicit=True, strategy=strategy)
+    assert [r["symbol"] for r in result["results"]] == ["BTC/USD", "XRP/USD"]
+    assert result["results"][0]["symbol_data_unavailable"] is True
+    assert result["status"] == "blocked" and result["skipped_symbols"] == []
+    assert strategy.decide.call_count == 1
+    assert strategy.decide.call_args.args[0].symbol == "XRP/USD"
+    assert automation._state()["failure_count"] == 0
+    broker.submit_order.assert_not_called()
+    assert db.connection.execute("SELECT count(*) FROM orders WHERE attempted=1").fetchone()[0] == 0
+
+
 def test_second_symbol_failure_counts_once_per_round_and_halts_after_three(dual_setup, monkeypatch):
     _, _, broker, automation, strategy = dual_setup
     now = utcnow()
