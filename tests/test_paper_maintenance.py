@@ -4,6 +4,7 @@ import json
 import runpy
 import shutil
 import sqlite3
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import Mock
@@ -59,10 +60,13 @@ def setup(tmp_path, monkeypatch):
         if args[0] in {"start", "restart"}:
             units[args[-1]]["ActiveState"] = "inactive" if args[-1] == MODULE["PAPER_SERVICE"] else "active"
         if args == ("start", "--no-block", MODULE["PAPER_SERVICE"]):
+            now = datetime.now(UTC).isoformat()
             with sqlite3.connect(maintenance.database) as db:
                 db.execute(
-                    "INSERT INTO auto_cycles VALUES ('verification','2026-10-04T03:00:00+00:00','2026-10-04T03:01:00+00:00','no_order',NULL,?)",
+                    "INSERT INTO auto_cycles VALUES ('verification',?,?,'no_order',NULL,?)",
                     (
+                        now,
+                        now,
                         json.dumps(
                             {
                                 "results": [
@@ -227,6 +231,44 @@ def test_optimization_defers_without_network_while_manually_paused(setup, monkey
     monkeypatch.setattr("crypto_agent.runner.make_broker", broker)
     assert maintenance.optimize(run_dir)["status"] == "deferred"
     broker.assert_not_called()
+
+
+def test_deferred_optimization_retries_after_diagnosis_without_losing_audit(setup, monkeypatch):
+    maintenance, run_dir, _ = setup
+    initial = {"status": "deferred", "reason": "Trading cycle active"}
+    evaluated = {"status": "evaluated", "current_multiplier": Decimal("1")}
+    optimize = Mock(return_value=evaluated)
+    monkeypatch.setattr(maintenance, "optimize", optimize)
+    result = maintenance.run({"repair_requested": False}, run_dir, None, optimization=initial)
+    optimize.assert_called_once_with(run_dir)
+    assert result["optimization"]["current_multiplier"] == "1"
+    assert result["initial_optimization"] == initial
+    assert json.loads((run_dir / "optimization-before-review.json").read_text()) == initial
+    assert json.loads((run_dir / "optimization.json").read_text())["status"] == "evaluated"
+
+
+def test_completed_optimization_does_not_repeat_consumed_holdout(setup, monkeypatch):
+    maintenance, run_dir, _ = setup
+    optimize = Mock(side_effect=AssertionError("Already evaluated holdout must not run twice"))
+    monkeypatch.setattr(maintenance, "optimize", optimize)
+    result = maintenance.run({"repair_requested": False}, run_dir, None, optimization={"status": "evaluated"})
+    assert result["optimization"]["status"] == "evaluated"
+    optimize.assert_not_called()
+
+
+def test_old_cycle_cannot_validate_a_new_deployment(setup):
+    maintenance, _, _ = setup
+    maintenance.systemctl("start", "--no-block", MODULE["PAPER_SERVICE"])
+    with pytest.raises(MaintenanceError, match="No new post-deployment"):
+        maintenance.verify_cycle([MODULE["BROKER_PATH"]], after=datetime.now(UTC))
+
+
+def test_blocked_tick_without_eligible_decision_cannot_validate_repair(setup):
+    maintenance, _, _ = setup
+    with sqlite3.connect(maintenance.database) as db:
+        db.execute("INSERT INTO auto_cycles VALUES ('blocked','2026-10-04','2026-10-04','blocked',NULL,'{}')")
+    with pytest.raises(MaintenanceError, match="No eligible post-repair decision"):
+        maintenance.verify_cycle([MODULE["BROKER_PATH"]])
 
 
 def test_periodic_optimizer_uses_existing_sample_gate_without_creating_trades(setup, monkeypatch):

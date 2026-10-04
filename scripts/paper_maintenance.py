@@ -201,13 +201,12 @@ class Maintenance:
         broker = db = None
         try:
             state = self.state()
-            if (
-                not state.get("enabled")
-                or state.get("pause_reason")
-                or state.get("unknown_orders")
-                or state.get("inflight")
-            ):
-                return {"status": "deferred", "reason": "Paused or unresolved Paper session"}
+            if not state.get("enabled") or state.get("pause_reason") or state.get("halt_reason"):
+                return {"status": "deferred", "reason": "Paper session paused or stopped"}
+            if state.get("unknown_orders"):
+                return {"status": "deferred", "reason": "Unresolved Paper submission"}
+            if state.get("inflight") or state.get("active_cycles"):
+                return {"status": "deferred", "reason": "Trading cycle active"}
             settings = load_settings(self.config, root=self.root)
             if state.get("approval_digest") != settings.digest:
                 return {"status": "deferred", "reason": "Unapproved configuration"}
@@ -346,13 +345,17 @@ class Maintenance:
         self.validate_candidate(candidate, manifest)
         return self.deploy(candidate, manifest, changed, run_dir, base_digest)
 
-    def verify_cycle(self, changed):
+    def verify_cycle(self, changed, after=None):
+        from crypto_agent.models import timestamp
+
         with sqlite3.connect(self.database.as_uri() + "?mode=ro", uri=True) as db:
             row = db.execute(
-                "SELECT status,body FROM auto_cycles ORDER BY started_at DESC LIMIT 1"
+                "SELECT status,body,started_at FROM auto_cycles ORDER BY started_at DESC LIMIT 1"
             ).fetchone()
         if not row or row[0] in {"started", "failed", "unknown", "halted", "submitting"}:
             raise MaintenanceError("No completed healthy verification cycle")
+        if after is not None and timestamp(row[2]) < after:
+            raise MaintenanceError("No new post-deployment verification cycle")
         body = json.loads(row[1] or "{}")
         decisions = [item.get("preview", {}).get("decision", {}) for item in body.get("results", [body])]
         if "src/crypto_agent/strategies/_intraday_ai_worker.py" in changed and any(
@@ -363,9 +366,12 @@ class Maintenance:
             for d in decisions
         ):
             raise MaintenanceError("Model protocol fault persists after repair")
+        eligible = sum(d.get("evaluation_eligible") is True for d in decisions)
+        if not eligible:
+            raise MaintenanceError("No eligible post-repair decision; repair remains unverified")
         return {
             "cycle_status": row[0],
-            "eligible_decisions": sum(d.get("evaluation_eligible") is True for d in decisions),
+            "eligible_decisions": eligible,
         }
 
     def deploy(self, candidate, manifest, changed, run_dir, base_digest=None):
@@ -513,6 +519,7 @@ class Maintenance:
                     while time.time() < next_allowed and not self.pause.exists():
                         time.sleep(min(2, next_allowed - time.time()))
                 if resume and not self.pause.exists():
+                    verification_started_at = datetime.now(UTC)
                     self.systemctl("start", "--no-block", PAPER_SERVICE)
                     deadline = time.monotonic() + 180
                     while self.unit(PAPER_SERVICE).get("ActiveState") in {"active", "activating"}:
@@ -526,7 +533,7 @@ class Maintenance:
                         or self.unit(PAPER_SERVICE).get("Result") != "success"
                     ):
                         raise MaintenanceError("Post-deployment tick failed")
-                    verification = self.verify_cycle(changed)
+                    verification = self.verify_cycle(changed, after=verification_started_at)
                     self.systemctl("start", PAPER_TIMER)
                 else:
                     verification = {"status": "deferred", "reason": "User paused during maintenance"}
@@ -574,10 +581,20 @@ class Maintenance:
                 db.close()
 
     def run(self, report, run_dir, codex, optimization=None):
+        initial_optimization = optimization
+        # Diagnosis can overlap an ordinary tick. Retry a deferred evaluation
+        # once afterwards; never repeat an already evaluated holdout.
+        if optimization is not None and optimization.get("status") == "deferred":
+            save(run_dir / "optimization-before-review.json", optimization)
+            optimization = self.optimize(run_dir)
+            save(run_dir / "optimization.json", optimization)
         result = {
             "optimization": self.optimize(run_dir) if optimization is None else optimization,
             "repair": {"status": "not_needed"},
+            "completed_at_utc": datetime.now(UTC).isoformat(),
         }
+        if initial_optimization is not None and initial_optimization.get("status") == "deferred":
+            result["initial_optimization"] = initial_optimization
         # Reuse the project's audited Decimal/datetime serialization at every
         # boundary, including prompt construction and the final combined report.
         from crypto_agent.models import dumps
@@ -591,5 +608,6 @@ class Maintenance:
                     "status": "blocked",
                     "reason": "Repair failed; check candidate and deployment audit",
                 }
+        result["completed_at_utc"] = datetime.now(UTC).isoformat()
         save(run_dir / "maintenance.json", result)
         return result
