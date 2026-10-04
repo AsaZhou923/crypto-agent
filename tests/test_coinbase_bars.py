@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -15,6 +16,7 @@ from crypto_agent.config import load_settings
 from crypto_agent.data.coinbase import SOURCE, CoinbaseMinuteBars
 from crypto_agent.data.features import build_intraday_features
 from crypto_agent.models import AgentError, BrokerError, BrokerReadUnavailable, MarketSnapshot
+from crypto_agent.risk.intraday import validate_entry_economics
 
 NOW = datetime(2026, 10, 4, 3, 30, 25, tzinfo=UTC)
 
@@ -124,6 +126,38 @@ def test_cross_venue_price_and_source_checks(monkeypatch):
         p.close()
 
 
+def test_entry_execution_rechecks_source_and_cross_venue_price(monkeypatch):
+    p, _ = provider(monkeypatch)
+    try:
+        bars = p.get_bars("BTC/USD")
+        strategy = {
+            "intraday_bar_source": "coinbase_exchange",
+            "intraday_max_quote_bar_deviation_bps": 100,
+            "intraday_require_cost_cover": True,
+            "intraday_lookback_bars": 60,
+            "intraday_min_bars": 45,
+            "intraday_max_bar_age_seconds": 180,
+            "intraday_momentum_threshold_bps": 2,
+        }
+        quote = MarketSnapshot("BTC/USD", D(102), NOW, D("101.99"), D("102.01"), "alpaca-crypto-us-orderbook")
+        order = SimpleNamespace(side="buy")
+        decision = SimpleNamespace(rating="Buy", created_at=NOW)
+        risk = {"fee_buffer_bps": 30, "slippage_bps": 20}
+        result = validate_entry_economics(order, quote, decision, bars, strategy, risk)
+        assert not result.allowed and "diverges" in result.reasons[0]
+        result = validate_entry_economics(
+            order,
+            replace(quote, price=D(100)),
+            decision,
+            tuple(replace(b, source="other") for b in bars),
+            strategy,
+            risk,
+        )
+        assert not result.allowed and "configured source" in result.reasons[0]
+    finally:
+        p.close()
+
+
 @pytest.mark.parametrize("status", [429, 500, 503])
 def test_transient_public_data_failure_is_deferred(monkeypatch, status):
     p, calls = provider(monkeypatch, status=status)
@@ -138,9 +172,12 @@ def test_transient_public_data_failure_is_deferred(monkeypatch, status):
 def test_source_and_price_bound_are_approval_bound_and_strict(tmp_path):
     for name in ("paper", "risk", "strategy"):
         shutil.copy2(Path("config/deployment/paper-session") / f"{name}.yaml", tmp_path / f"{name}.yaml")
-    old = load_settings(tmp_path)
     path = tmp_path / "strategy.yaml"
     config = yaml.safe_load(path.read_text())
+    config.pop("intraday_bar_source", None)
+    config.pop("intraday_max_quote_bar_deviation_bps", None)
+    path.write_text(yaml.safe_dump(config))
+    old = load_settings(tmp_path)
     config.update(intraday_bar_source="coinbase_exchange", intraday_max_quote_bar_deviation_bps=100)
     path.write_text(yaml.safe_dump(config))
     new = load_settings(tmp_path)

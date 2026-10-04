@@ -34,3 +34,5 @@ intraday_probe_profile: expanded_paper
 intraday_trade_filter: confirm2_cooldown30
 intraday_require_cost_cover: true
 intraday_entry_cooldown_seconds: 1800
+intraday_bar_source: coinbase_exchange
+intraday_max_quote_bar_deviation_bps: 100

@@ -1,5 +1,5 @@
 [Unit]
-Description=Review Crypto Agent Paper strategy every two hours
+Description=Review, repair and optimize Crypto Agent Paper every two hours
 
 [Timer]
 OnCalendar=*-*-* 00/2:20:00

@@ -158,9 +158,13 @@ def sync():
 def main() -> int:
     os.umask(0o077)
     DIRECTORY.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with (DIRECTORY / "sync.lock").open("a") as lock:
+    with (
+        (DIRECTORY / "sync.lock").open("a") as lock,
+        (ROOT / "runtime/deployment.lock").open("a") as deployment,
+    ):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(deployment, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
         try:

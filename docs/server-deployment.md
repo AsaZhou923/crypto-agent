@@ -85,15 +85,17 @@ Codex `btc-paper` 和每两小时策略优化自动化 `paper` 均为 PAUSED。
 
 ## Codex 两小时策略检查
 
+2026-10-04 针对持续缺线引入显式 Coinbase 分析分钟线；执行仍使用 Alpaca US 的新鲜 orderbook。跨来源价格偏差检查和调度跳过边界见 [Paper 行情修复](market-data-repair.md)。判断当前分钟线来源应读取当前 strategy YAML 和持久化 bars.source，而不是迁移时的历史描述。
+
 2026-09-30 的成本覆盖、入场冷却、费用元数据、分页和评估时效改进见 [v5.2 Paper 优化](paper-v5.2-economic-optimization.md)。新策略效果需要后续独立数据验证。
 
-`crypto-agent-strategy-review.timer` 在 JST 双数小时的 20 分触发 `crypto-agent-strategy-review.service`，不会补跑错过的时间。服务以 optiplex 用户启动本机已经登录的 Codex CLI，用官方 `codex exec --sandbox read-only` 模式检查服务器的 Paper 账本、策略、风控和调度证据。[Codex 非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)支持在脚本和计划任务中运行，并默认只读。
+2026-10-04 起，`crypto-agent-strategy-review.timer` 仍在 JST 双数小时的20分触发，但由 [自动维护流程](autonomous-paper-maintenance.md) 执行“检查、恢复、候选修复、回归、部署和参数优化”。定时器不补跑；单次任务总上限55分钟，不重叠。
 
-提示词和 JSON 报告格式分别保存在 `deploy/strategy-review.prompt.md` 与 `deploy/strategy-review.schema.json`。每次完整报告存入 `runtime/hourly-strategy-review/<UTC时间>/report.json`，最近报告写入 `server-review-latest.json`；`attention/blocked` 结果仅保存在服务器，不发送 Telegram 通知。Codex 调用有 25 分钟超时，systemd 总超时 30 分钟；失败写入该次目录的 `failure.json` 并返回失败状态，同样不发送 Telegram 通知。定时器不执行 `auto-tick` 或修改生产文件。
+包装器先恢复仍启用但停止的面板/交易定时器，或在没有暂停、未知订单、inflight及活动周期的情况下恢复过期心跳；再用现有可信评估器进行受限策略评估。Codex诊断阶段保持read-only，发现有证据的软件缺陷后，在生产Git目录外的隔离候选目录使用workspace-write修复。生产写入由包装器完成，模型不直接控制生产服务。
 
-2026-09-28 20:15–20:20 JST 已完成首份服务器 Codex 检查，服务退出码 0，JSON 报告为 `attention`：XRP/USD 分钟线持续缺口、信号被安全过滤；没有发现未知提交或当前风控停机。下一次计划触发为 22:20 JST。
+修改范围、原有测试保护、备份、批准摘要、新样本隔离和实际周期验证由包装器强制检查。风险/执行/自动化核心及原有风控不可被候选改写。未知提交、日亏损及手动暂停不会被自动解除；无法验证的修复记录明确的受阻原因，失败时回滚代码/配置或保留暂停，不覆盖成交账本。
 
-这一迁移恢复了定期策略和执行检查。原本地任务中“研究后自主改码并上线”的能力没有放到无人值守的交易服务器；报告给出具体问题和证据，再在单独的代码任务中验证、上线。这样正在运行的交易版本不会在后台检查时被更改。查看状态：
+报告和实际动作保存到`runtime/hourly-strategy-review/<UTC时间>/`，最近汇总仍为`server-review-latest.json`。`maintenance`包含恢复、优化、修复/验证结果，不再仅给出next_step。保持原有静默通知方式。本次用户明确授权取代迁移时“只读、不自动改码”的部署边界。查看状态：
 
 ```sh
 systemctl --user status crypto-agent-strategy-review.timer crypto-agent-strategy-review.service

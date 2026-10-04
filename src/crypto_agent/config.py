@@ -346,6 +346,7 @@ def load_settings(
             "intraday_entry_cooldown_seconds",
             "intraday_bar_source",
             "intraday_max_quote_bar_deviation_bps",
+            "maintenance_revision",
         },
     )
     _required(
@@ -371,6 +372,14 @@ def load_settings(
     )
     if strategy["name"] not in {"baseline", "tradingagents", "intraday_ai"}:
         raise AgentError("Strategy must be baseline, tradingagents or intraday_ai")
+    if "maintenance_revision" in strategy:
+        revision = strategy["maintenance_revision"]
+        if (
+            not isinstance(revision, str)
+            or len(revision) != 64
+            or any(c not in "0123456789abcdef" for c in revision)
+        ):
+            raise AgentError("maintenance_revision must be a lowercase SHA256 digest")
     bar_source = strategy.get("intraday_bar_source", "alpaca_crypto_us")
     if not isinstance(bar_source, str) or bar_source not in {"alpaca_crypto_us", "coinbase_exchange"}:
         raise AgentError("Unsupported intraday_bar_source")

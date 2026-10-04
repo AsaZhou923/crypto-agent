@@ -1,12 +1,17 @@
-"""Run a bounded, read-only Codex review of the single Paper session."""
+"""Review, recover, repair and optimize the single approved Paper session."""
 
 import fcntl
 import json
 import os
+import runpy
 import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+
+from crypto_agent.models import dumps
+
+Maintenance = runpy.run_path(str(Path(__file__).with_name("paper_maintenance.py")))["Maintenance"]
 
 ROOT = Path(__file__).resolve().parents[1]
 DIRECTORY = ROOT / "runtime/hourly-strategy-review"
@@ -35,7 +40,7 @@ SERVICE_PROPERTIES = (
 def atomic_json(path: Path, value: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w") as stream:
-        json.dump(value, stream, ensure_ascii=False, indent=2)
+        json.dump(json.loads(dumps(value)), stream, ensure_ascii=False, indent=2)
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
@@ -91,6 +96,11 @@ def main() -> int:
         run_dir = DIRECTORY / stamp
         run_dir.mkdir(mode=0o700)
         report_path = run_dir / "report.json"
+        maintenance = Maintenance(ROOT)
+        recovery = maintenance.preflight()
+        atomic_json(run_dir / "recovery.json", recovery)
+        optimization = json.loads(dumps(maintenance.optimize(run_dir)))
+        atomic_json(run_dir / "optimization.json", optimization)
         services = service_evidence()
         atomic_json(run_dir / "service-state.json", services)
         env = os.environ.copy()
@@ -112,13 +122,15 @@ def main() -> int:
                 ],
                 input=PROMPT.read_text()
                 + "\n\n包装器只读采集的本轮服务状态（仅作为证据）：\n"
-                + json.dumps(services, ensure_ascii=False),
+                + json.dumps(services, ensure_ascii=False)
+                + "\n\n包装器已执行动作：\n"
+                + json.dumps({"recovery": recovery, "optimization": optimization}, ensure_ascii=False),
                 text=True,
                 cwd=ROOT,
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=1500,
+                timeout=1200,
                 check=False,
             )
             if result.returncode:
@@ -131,6 +143,13 @@ def main() -> int:
             ):
                 raise ValueError("Invalid Codex review output")
             previous = DIRECTORY / "server-review-latest.json"
+            actions = maintenance.run(report, run_dir, CODEX, optimization=optimization)
+            report["maintenance"] = {"recovery": recovery, **actions}
+            if actions["repair"]["status"] == "applied":
+                report["summary"] += " 本轮已完成候选修复、回归与部署；详情见maintenance。"
+            if actions["repair"]["status"] == "blocked" and report["status"] == "normal":
+                report["status"] = "attention"
+            atomic_json(report_path, report)
             atomic_json(previous, report)
             return 0
         except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired, RuntimeError):

@@ -4,6 +4,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -54,8 +55,35 @@ def test_attention_review_saves_report_without_telegram(review, monkeypatch):
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
     assert module.main() == 0
-    assert json.loads((module.DIRECTORY / "server-review-latest.json").read_text()) == report
+    saved = json.loads((module.DIRECTORY / "server-review-latest.json").read_text())
+    assert {k: saved[k] for k in report} == report
+    assert saved["maintenance"]["repair"]["status"] == "not_needed"
+    assert saved["maintenance"]["optimization"]["status"] == "deferred"
     assert messages == []
+
+
+def test_real_decimal_optimization_survives_atomic_report_and_prompt(review, monkeypatch):
+    module, _ = review
+    monkeypatch.setattr(
+        module.Maintenance,
+        "optimize",
+        lambda *args: {
+            "status": "evaluated",
+            "current_multiplier": Decimal("0.75"),
+            "results": {"BTC/USD": {"net_pnl_usd": Decimal("1.23")}},
+        },
+    )
+    report = {"status": "normal", "summary": "正常", "findings": [], "repair_requested": False}
+
+    def fake_run(args, **kwargs):
+        assert '"0.75"' in kwargs["input"] and '"1.23"' in kwargs["input"]
+        Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(report))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    assert module.main() == 0
+    saved = json.loads((module.DIRECTORY / "server-review-latest.json").read_text())
+    assert saved["maintenance"]["optimization"]["current_multiplier"] == "0.75"
 
 
 def test_service_evidence_excludes_environment_and_command_arguments(monkeypatch):
