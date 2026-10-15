@@ -233,6 +233,10 @@ class Monitor:
 
     def agent(self):
         value = agent_view(self.database(), self.account_id)
+        profile = self.settings.strategy.get("decision_profile") if self.settings else None
+        if profile in {"intraday_10m", "intraday_1to6h"}:
+            value["strategy_profile"] = profile
+            value["holding_horizon_minutes"] = [60, 360] if profile == "intraday_1to6h" else [10, 180]
         cached_ledger = self.cache.entries.get("ledger")
         ledger = cached_ledger[1].get("data") if cached_ledger else None
         if ledger:

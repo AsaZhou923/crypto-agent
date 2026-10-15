@@ -7,11 +7,13 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
 import yaml
 
+from crypto_agent.brokers.alpaca_paper import PAPER_URL, AlpacaPaperBroker
 from crypto_agent.config import load_settings
 from crypto_agent.data.coinbase import SOURCE, CoinbaseMinuteBars
 from crypto_agent.data.features import build_intraday_features
@@ -29,6 +31,10 @@ def candles():
     ]
 
 
+def candle_at(minute, *, close="100"):
+    return [int(minute.timestamp()), "99", "101", "100", close, "1.23456789"]
+
+
 def provider(monkeypatch, payload=None, status=200):
     monkeypatch.setattr("crypto_agent.data.coinbase.utcnow", lambda: NOW)
     calls = []
@@ -36,6 +42,30 @@ def provider(monkeypatch, payload=None, status=200):
     def handler(request):
         calls.append(request)
         return httpx.Response(status, content=json.dumps(candles() if payload is None else payload))
+
+    return CoinbaseMinuteBars(transport=httpx.MockTransport(handler)), calls
+
+
+def multipage_provider(monkeypatch, *, conflicting_boundary=False, unrelated_overlap=False):
+    monkeypatch.setattr("crypto_agent.data.coinbase.utcnow", lambda: NOW)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        params = parse_qs(request.url.query.decode())
+        start = datetime.fromisoformat(params["start"][0])
+        end = datetime.fromisoformat(params["end"][0])
+        rows = []
+        minute = start
+        if unrelated_overlap and len(calls) == 2:
+            rows.append(candle_at(start - timedelta(minutes=1)))
+        while minute <= end:
+            close = "100"
+            if conflicting_boundary and len(calls) == 2 and minute == start:
+                close = "100.5"
+            rows.append(candle_at(minute, close=close))
+            minute += timedelta(minutes=1)
+        return httpx.Response(200, content=json.dumps(rows))
 
     return CoinbaseMinuteBars(transport=httpx.MockTransport(handler)), calls
 
@@ -72,6 +102,87 @@ def test_only_closed_actual_candles_with_explicit_window_and_no_credentials(monk
         assert not any("apca" in key or "authorization" in key for key in request.headers)
     finally:
         p.close()
+
+
+def test_long_coinbase_history_uses_bounded_pages_and_deduplicates_shared_boundary(monkeypatch):
+    p, calls = multipage_provider(monkeypatch)
+    try:
+        bars = p.get_bars("BTC/USD", limit=481)
+        assert len(calls) == 2
+        assert len(bars) == 481
+        assert bars[-1].observed_at == NOW.replace(second=0) - timedelta(minutes=1)
+        for request in calls:
+            params = parse_qs(request.url.query.decode())
+            start = datetime.fromisoformat(params["start"][0])
+            end = datetime.fromisoformat(params["end"][0])
+            assert (end - start) <= timedelta(minutes=290)
+        assert len({bar.observed_at for bar in bars}) == 481
+    finally:
+        p.close()
+
+
+def test_final_page_past_shared_deadline_is_deferred_without_partial_bars(monkeypatch):
+    ticks = iter([100, 100, 100, 100, 116])
+    monkeypatch.setattr("crypto_agent.data.coinbase.monotonic", lambda: next(ticks))
+    p, calls = multipage_provider(monkeypatch)
+    try:
+        with pytest.raises(BrokerReadUnavailable):
+            p.get_bars("BTC/USD", limit=481)
+        assert len(calls) == 2
+    finally:
+        p.close()
+
+
+def test_conflicting_cross_page_duplicate_is_rejected(monkeypatch):
+    p, _ = multipage_provider(monkeypatch, conflicting_boundary=True)
+    try:
+        with pytest.raises(BrokerError, match="missing or invalid"):
+            p.get_bars("BTC/USD", limit=480)
+    finally:
+        p.close()
+
+
+def test_unrelated_cross_page_overlap_is_rejected(monkeypatch):
+    p, _ = multipage_provider(monkeypatch, unrelated_overlap=True)
+    try:
+        with pytest.raises(BrokerError, match="missing or invalid"):
+            p.get_bars("BTC/USD", limit=480)
+    finally:
+        p.close()
+
+
+def test_coinbase_history_limit_allows_request_padding_only_to_four_eighty_one(monkeypatch):
+    p, _ = provider(monkeypatch)
+    try:
+        with pytest.raises(BrokerError, match="limit in \\[30, 481\\]"):
+            p.get_bars("BTC/USD", limit=482)
+    finally:
+        p.close()
+
+
+def test_alpaca_broker_delegates_extended_coinbase_history(monkeypatch):
+    class Provider:
+        def get_bars(self, symbol, *, timeframe, limit):
+            assert symbol == "BTC/USD"
+            assert timeframe == "1Min"
+            assert limit == 480
+            return ("delegated",)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("crypto_agent.data.coinbase.CoinbaseMinuteBars", lambda timeout: Provider())
+    broker = AlpacaPaperBroker(
+        PAPER_URL,
+        "key",
+        "secret",
+        symbols=("BTC/USD",),
+        bar_source="coinbase_exchange",
+    )
+    try:
+        assert broker.get_bars("BTC/USD", limit=480) == ("delegated",)
+    finally:
+        broker.close()
 
 
 @pytest.mark.parametrize(
@@ -176,6 +287,7 @@ def test_source_and_price_bound_are_approval_bound_and_strict(tmp_path):
     config = yaml.safe_load(path.read_text())
     config.pop("intraday_bar_source", None)
     config.pop("intraday_max_quote_bar_deviation_bps", None)
+    config.update(decision_profile="intraday_10m", intraday_lookback_bars=60, intraday_min_bars=45)
     path.write_text(yaml.safe_dump(config))
     old = load_settings(tmp_path)
     config.update(intraday_bar_source="coinbase_exchange", intraday_max_quote_bar_deviation_bps=100)

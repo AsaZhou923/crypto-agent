@@ -63,6 +63,9 @@ def test_regular_minutes_keep_exact_return_horizons_and_momentum():
     assert result.return_30m_bps == (D(159) / D(129) - 1) * D(10000)
     assert result.momentum_score == 4
     assert result.recent_volume_ratio == 1
+    assert result.positive_move_proxy_bps == result.return_30m_bps
+    assert "positive_move_proxy_bps" not in result.payload()
+    assert "return_evidence" not in result.payload()
 
 
 @pytest.mark.parametrize("gap_seconds", [59, 61, 120, 180])

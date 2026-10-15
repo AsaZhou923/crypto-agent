@@ -62,7 +62,11 @@ class Settings:
         result = {"paper": self.paper, "strategy": self.strategy, "risk": self.risk, "mode": self.mode}
         if self.strategy.get("name") == "intraday_ai":
             # Bind the corrected minute-clock semantics to previews and approval.
-            result["intraday_feature_contract"] = "contiguous-60-second-bars-v1"
+            result["intraday_feature_contract"] = (
+                "contiguous-60sec-granular-hour-horizon-v1"
+                if self.strategy.get("decision_profile") == "intraday_1to6h"
+                else "contiguous-60-second-bars-v1"
+            )
         return result
 
     @property
@@ -222,6 +226,25 @@ def validate_intraday_entry_economics(strategy: dict) -> bool:
     return enabled
 
 
+def _validate_hour_intraday_profile(strategy: dict, paper: dict, mode: str) -> None:
+    if strategy.get("decision_profile") != "intraday_1to6h":
+        return
+    if mode != "paper":
+        raise AgentError("intraday_1to6h is Paper-only")
+    if set(paper.get("symbols", ())) != {"BTC/USD", "XRP/USD"} or len(paper.get("symbols", ())) != 2:
+        raise AgentError("intraday_1to6h requires Paper symbols BTC/USD and XRP/USD only")
+    if paper.get("fresh_market_wait_seconds") != 60:
+        raise AgentError("intraday_1to6h requires fresh_market_wait_seconds: 60")
+    if strategy.get("intraday_bar_source") != "coinbase_exchange":
+        raise AgentError("intraday_1to6h requires coinbase_exchange bars")
+    if strategy.get("intraday_max_bar_age_seconds") != 180:
+        raise AgentError("intraday_1to6h requires intraday_max_bar_age_seconds: 180")
+    if strategy.get("intraday_max_quote_bar_deviation_bps") != 100:
+        raise AgentError("intraday_1to6h requires intraday_max_quote_bar_deviation_bps: 100")
+    if validate_intraday_entry_economics(strategy) is not True:
+        raise AgentError("intraday_1to6h requires explicit cost-cover economics")
+
+
 def validate_intraday_policy(strategy: dict) -> str:
     validate_intraday_trade_filter(strategy)
     validate_intraday_entry_economics(strategy)
@@ -322,6 +345,7 @@ def load_settings(
             "backend_url",
             "deep_think_llm",
             "quick_think_llm",
+            "reasoning_effort",
             "selected_analysts",
             "max_debate_rounds",
             "max_risk_discuss_rounds",
@@ -398,6 +422,7 @@ def load_settings(
     entry_economics = validate_intraday_entry_economics(strategy)
     if entry_economics and mode != "paper":
         raise AgentError("intraday_require_cost_cover is Paper-only")
+    _validate_hour_intraday_profile(strategy, paper, mode)
     if strategy["asset_type"] != "crypto":
         raise AgentError("TradingAgents requires explicit crypto mode")
     if strategy["analysis_symbol"] not in {upstream_symbol(value) for value in SUPPORTED_SYMBOLS}:
@@ -431,6 +456,12 @@ def load_settings(
         _integer(strategy, key, 1, 3)
     if not isinstance(strategy["output_language"], str) or not strategy["output_language"].strip():
         raise AgentError("output_language must be nonempty")
+    if "reasoning_effort" in strategy:
+        effort = strategy["reasoning_effort"]
+        if not isinstance(effort, str) or effort not in {"low", "medium", "high", "xhigh", "max"}:
+            raise AgentError("reasoning_effort must be low, medium, high, xhigh or max")
+        if strategy["name"] != "intraday_ai" or strategy.get("llm_provider") != "openai":
+            raise AgentError("reasoning_effort requires intraday_ai with llm_provider: openai")
     if strategy["name"] == "intraday_ai":
         _required(
             strategy,
@@ -444,12 +475,18 @@ def load_settings(
             ),
             "intraday strategy configuration",
         )
-        if strategy["decision_profile"] != "intraday_10m":
-            raise AgentError("intraday_ai requires decision_profile: intraday_10m")
+        if strategy["decision_profile"] not in {"intraday_10m", "intraday_1to6h"}:
+            raise AgentError("intraday_ai requires decision_profile: intraday_10m or intraday_1to6h")
         if strategy.get("llm_provider") != "openai":
             raise AgentError("intraday_ai currently requires llm_provider: openai")
-        _integer(strategy, "intraday_lookback_bars", 31, 239)
-        _integer(strategy, "intraday_min_bars", 31, strategy["intraday_lookback_bars"])
+        if strategy["decision_profile"] == "intraday_1to6h":
+            _integer(strategy, "intraday_lookback_bars", 361, 480)
+            _integer(strategy, "intraday_min_bars", 361, strategy["intraday_lookback_bars"])
+            if strategy["intraday_lookback_bars"] + 1 > 481:
+                raise AgentError("intraday_1to6h bar request must not exceed 481")
+        else:
+            _integer(strategy, "intraday_lookback_bars", 31, 239)
+            _integer(strategy, "intraday_min_bars", 31, strategy["intraday_lookback_bars"])
         _integer(strategy, "intraday_max_bar_age_seconds", 1, 600)
         _integer(strategy, "intraday_entry_score", 1, 4)
         validate_intraday_policy(strategy)

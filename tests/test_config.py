@@ -564,6 +564,56 @@ def test_entry_cost_cover_is_paper_only(filtered_config):
         load_settings(root=filtered_config, mode="offline")
 
 
+def test_hour_intraday_profile_is_explicit_paper_coinbase_contract(filtered_config):
+    update(filtered_config, "paper.yaml", fresh_market_wait_seconds=60)
+    update(
+        filtered_config,
+        "strategy.yaml",
+        decision_profile="intraday_1to6h",
+        intraday_lookback_bars=480,
+        intraday_min_bars=361,
+        intraday_trade_filter="confirm2_cooldown30",
+        intraday_require_cost_cover=True,
+        intraday_entry_cooldown_seconds=1800,
+        intraday_bar_source="coinbase_exchange",
+        intraday_max_quote_bar_deviation_bps=100,
+    )
+    settings = load_settings(root=filtered_config, mode="paper")
+    assert settings.strategy["decision_profile"] == "intraday_1to6h"
+    assert settings.strategy["intraday_lookback_bars"] + 1 <= 481
+    assert settings.summary["intraday_feature_contract"] == "contiguous-60sec-granular-hour-horizon-v1"
+
+
+@pytest.mark.parametrize(
+    "file,values,match",
+    [
+        ("strategy.yaml", {"intraday_lookback_bars": 481}, "intraday_lookback_bars"),
+        ("strategy.yaml", {"intraday_min_bars": 360}, "intraday_min_bars"),
+        ("strategy.yaml", {"intraday_bar_source": "alpaca_crypto_us"}, "coinbase_exchange"),
+        ("strategy.yaml", {"intraday_require_cost_cover": False}, "intraday_require_cost_cover"),
+        ("paper.yaml", {"symbols": ["BTC/USD"], "automatic_symbols_per_cycle": 1}, "BTC/USD and XRP/USD"),
+        ("paper.yaml", {"fresh_market_wait_seconds": 30}, "fresh_market_wait_seconds"),
+    ],
+)
+def test_hour_intraday_profile_rejects_partial_or_relaxed_configuration(filtered_config, file, values, match):
+    update(filtered_config, "paper.yaml", fresh_market_wait_seconds=60)
+    update(
+        filtered_config,
+        "strategy.yaml",
+        decision_profile="intraday_1to6h",
+        intraday_lookback_bars=480,
+        intraday_min_bars=361,
+        intraday_trade_filter="confirm2_cooldown30",
+        intraday_require_cost_cover=True,
+        intraday_entry_cooldown_seconds=1800,
+        intraday_bar_source="coinbase_exchange",
+        intraday_max_quote_bar_deviation_bps=100,
+    )
+    update(filtered_config, file, **values)
+    with pytest.raises(AgentError, match=match):
+        load_settings(root=filtered_config, mode="paper")
+
+
 def test_explicit_none_trade_filter_keeps_old_modes(config):
     update(config, "strategy.yaml", intraday_trade_filter="none")
     assert load_settings(root=config, mode="offline").strategy["intraday_trade_filter"] == "none"
@@ -582,3 +632,32 @@ def test_intraday_feature_contract_changes_approval_digest():
     assert summary.pop("intraday_feature_contract") == "contiguous-60-second-bars-v1"
     assert current.digest != sha256(dumps(summary).encode()).hexdigest()
     assert "intraday_feature_contract" not in base.summary
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+def test_reasoning_effort_is_optional_and_approval_bound(filtered_config, effort):
+    from dataclasses import replace
+
+    legacy = load_settings(root=filtered_config)
+    assert "reasoning_effort" not in legacy.strategy
+    update(filtered_config, "strategy.yaml", reasoning_effort=effort)
+    configured = load_settings(root=filtered_config)
+    assert configured.strategy["reasoning_effort"] == effort
+    assert configured.digest != legacy.digest
+    restored = dict(configured.strategy)
+    restored.pop("reasoning_effort")
+    assert replace(configured, strategy=restored).digest == legacy.digest
+
+
+@pytest.mark.parametrize("effort", [None, True, 1, "", "Medium", "none", "minimal", [], {}])
+def test_reasoning_effort_rejects_invalid_values(filtered_config, effort):
+    update(filtered_config, "strategy.yaml", reasoning_effort=effort)
+    with pytest.raises(AgentError, match="reasoning_effort"):
+        load_settings(root=filtered_config)
+
+
+@pytest.mark.parametrize("name,provider", [("baseline", "openai"), ("tradingagents", "openai"), ("baseline", "anthropic")])
+def test_reasoning_effort_is_only_supported_for_openai_intraday(config, name, provider):
+    update(config, "strategy.yaml", name=name, llm_provider=provider, reasoning_effort="medium")
+    with pytest.raises(AgentError, match="reasoning_effort requires intraday_ai"):
+        load_settings(root=config)

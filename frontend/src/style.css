@@ -612,6 +612,8 @@ main {
 }
 .agent-status {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   justify-content: space-between;
   align-items: center;
   border-top: 1px solid #232b35;

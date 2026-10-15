@@ -90,6 +90,8 @@ export type Decision = {
   raw: unknown;
 };
 export type Agent = {
+  strategy_profile?: string;
+  holding_horizon_minutes?: [number, number];
   decisions: Decision[];
   logs: {
     id: string;

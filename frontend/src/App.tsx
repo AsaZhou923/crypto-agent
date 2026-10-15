@@ -1090,6 +1090,14 @@ export default function App() {
             </div>
             <div className="agent-status">
               <Source section={sections?.agent} compact />
+              {agent?.holding_horizon_minutes && (
+                <span>
+                  目标持仓{" "}
+                  {agent.holding_horizon_minutes.every((minutes) => minutes % 60 === 0)
+                    ? `${agent.holding_horizon_minutes[0] / 60}–${agent.holding_horizon_minutes[1] / 60} 小时`
+                    : `${agent.holding_horizon_minutes[0]}–${agent.holding_horizon_minutes[1]} 分钟`}
+                </span>
+              )}
               <span>{agent ? statusLabel(agent.status) : "读取中"}</span>
             </div>
             <DecisionPanel

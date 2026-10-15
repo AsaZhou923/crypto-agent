@@ -4,18 +4,19 @@ upstream_commit: 2d17df8da1536c121e4d7395ac5a5dcec9e96d6f
 analysis_symbol: BTC-USD
 asset_type: crypto
 llm_provider: openai
-deep_think_llm: gpt-5.6-luna
-quick_think_llm: gpt-5.6-luna
+deep_think_llm: gpt-6.1-sol
+quick_think_llm: gpt-6.1-sol
+reasoning_effort: medium
 selected_analysts:
 - market
 max_debate_rounds: 1
 max_risk_discuss_rounds: 1
 output_language: Chinese
-decision_profile: intraday_10m
+decision_profile: intraday_1to6h
 timeout_seconds: 60
 decision_ttl_seconds: 240
-intraday_lookback_bars: 60
-intraday_min_bars: 45
+intraday_lookback_bars: 480
+intraday_min_bars: 361
 intraday_max_bar_age_seconds: 180
 intraday_momentum_threshold_bps: 2
 intraday_entry_score: 2

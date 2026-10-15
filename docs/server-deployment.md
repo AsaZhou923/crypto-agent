@@ -85,6 +85,8 @@ Codex `btc-paper` 和每两小时策略优化自动化 `paper` 均为 PAUSED。
 
 ## Codex 两小时策略检查
 
+2026-10-07 用户选择的 1–6 小时低换手策略及其独立验证边界见 [v5.3 小时级 Paper 实验](paper-v5.3-hourly-low-turnover.md)。
+
 2026-10-04 针对持续缺线引入显式 Coinbase 分析分钟线；执行仍使用 Alpaca US 的新鲜 orderbook。跨来源价格偏差检查和调度跳过边界见 [Paper 行情修复](market-data-repair.md)。判断当前分钟线来源应读取当前 strategy YAML 和持久化 bars.source，而不是迁移时的历史描述。
 
 2026-09-30 的成本覆盖、入场冷却、费用元数据、分页和评估时效改进见 [v5.2 Paper 优化](paper-v5.2-economic-optimization.md)。新策略效果需要后续独立数据验证。

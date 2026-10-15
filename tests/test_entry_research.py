@@ -66,6 +66,35 @@ def test_filters_only_suppress_entries_and_need_original_features():
         assert entry_research.filtered_observation(item, features, variant, risk=risk) is item
 
 
+def test_hour_cost_cover_uses_hour_proxy_without_legacy_short_fields():
+    item = replace(sample(), strategy_version="intraday-ai-1min-v5.3-1h6h-low-turnover-paper")
+    features = SimpleNamespace(
+        momentum_score=3,
+        return_60m_bps=D(120),
+        return_180m_bps=D(160),
+        return_360m_bps=D(200),
+        ema_60_vs_180_bps=D(5),
+        positive_move_proxy_bps=D(200),
+    )
+    risk = {"fee_buffer_bps": D(30), "slippage_bps": D(20)}
+    strategy = {"decision_profile": "intraday_1to6h"}
+    assert (
+        entry_research.filtered_observation(item, features, "cost_cover", risk=risk, strategy=strategy)
+        is item
+    )
+    weak = SimpleNamespace(
+        **{
+            **features.__dict__,
+            "return_60m_bps": D(1),
+            "return_180m_bps": D(2),
+            "return_360m_bps": D(5),
+            "positive_move_proxy_bps": D(200),
+        }
+    )
+    filtered = entry_research.filtered_observation(item, weak, "cost_cover", risk=risk, strategy=strategy)
+    assert filtered.rating == "REVIEW" and not filtered.actionable
+
+
 def test_cooldown_research_variant_is_stateful_without_changing_original_observation():
     item = sample()
     later = replace(item, observed_at=item.observed_at + timedelta(minutes=5))
@@ -268,4 +297,109 @@ def test_research_derives_current_paper_rotation_cadence_and_segments_gaps(tmp_p
     assert report["symbols"]["BTC/USD"]["withheld_observations"] == 2
     assert report["symbols"]["BTC/USD"]["segment_count"] == 2
     assert max(inspected) < 4
+    c.close()
+
+
+def test_hour_research_uses_hour_variants_and_keeps_holdout_uncomputed(tmp_path, monkeypatch):
+    path = tmp_path / "snapshot.sqlite"
+    c = sqlite3.connect(path)
+    c.executescript("""
+        CREATE TABLE runs(id TEXT, created_at TEXT, config_digest TEXT, config_json TEXT, market_json TEXT);
+        CREATE TABLE metadata(key TEXT, value TEXT);
+        CREATE TABLE strategy_observations(id INTEGER, run_id TEXT, body TEXT);
+        CREATE TABLE decisions(run_id TEXT, body TEXT);
+        CREATE TABLE intraday_contexts(run_id TEXT, body TEXT);
+    """)
+    risk = load_settings(Path("config/demo"), "offline").risk
+    strategy = {
+        "name": "intraday_ai",
+        "quick_think_llm": "test",
+        "decision_profile": "intraday_1to6h",
+        "intraday_entry_policy": "capped_probe",
+        "intraday_probe_profile": "expanded_paper",
+        "intraday_trade_filter": "confirm2_cooldown30",
+        "intraday_require_cost_cover": True,
+        "intraday_entry_cooldown_seconds": 1800,
+        "intraday_probe_max_position_usd": D(5000),
+        "intraday_probe_cost_budget_usd": D(75),
+        "intraday_bar_source": "coinbase_exchange",
+        "intraday_max_quote_bar_deviation_bps": 100,
+        "intraday_lookback_bars": 480,
+        "intraday_min_bars": 361,
+        "intraday_max_bar_age_seconds": 180,
+        "intraday_momentum_threshold_bps": D(2),
+        "rating_target_pct": {
+            "Buy": D(".0005"),
+            "Overweight": D(".0003"),
+            "Underweight": D(".0001"),
+            "Sell": D(0),
+        },
+    }
+    config = {
+        "paper": {"automatic_interval_seconds": 300, "automatic_symbols_per_cycle": 2},
+        "strategy": strategy,
+        "risk": risk,
+    }
+    c.execute("INSERT INTO metadata VALUES('automatic_policy',?)", (dumps({"approval_digest": "cohort"}),))
+    for index in range(6):
+        item = replace(
+            sample("Buy"),
+            strategy_version="intraday-ai-1min-v5.3-1h6h-low-turnover-paper",
+        )
+        delta = timedelta(minutes=5 * index)
+        item = replace(item, observed_at=item.observed_at + delta, available_at=item.available_at + delta)
+        c.execute(
+            "INSERT INTO runs VALUES(?,?,?,?,?)",
+            (str(index), item.observed_at.isoformat(), "effective-config", dumps(config), "{}"),
+        )
+        c.execute("INSERT INTO strategy_observations VALUES(?,?,?)", (index, str(index), dumps(item)))
+        c.execute("INSERT INTO decisions VALUES(?,?)", (str(index), "{}"))
+        c.execute("INSERT INTO intraday_contexts VALUES(?,?)", (str(index), "[]"))
+    c.commit()
+    assets = tmp_path / "assets.json"
+    assets.write_text(
+        dumps(
+            {
+                "assets": {
+                    s: {
+                        "symbol": s,
+                        "tradable": True,
+                        "min_order_size": "0.000000001",
+                        "quantity_increment": "0.000000001",
+                        "price_increment": "0.000000001",
+                    }
+                    for s in ("BTC/USD", "XRP/USD")
+                }
+            }
+        )
+    )
+    inspected = []
+
+    def features(row, strategy):
+        inspected.append(row["id"])
+        return SimpleNamespace(
+            momentum_score=3,
+            return_60m_bps=D(120),
+            return_180m_bps=D(160),
+            return_360m_bps=D(200),
+            ema_60_vs_180_bps=D(5),
+            positive_move_proxy_bps=D(200),
+        )
+
+    monkeypatch.setattr(entry_research, "_features", features)
+    report = entry_research.compare(path, assets)
+    assert set(report["variants"]) == set(entry_research.HOURLY_VARIANTS)
+    assert "aligned_short_trend" not in report["variants"]
+    assert report["holdout_evaluated"] is False
+    assert report["symbols"]["BTC/USD"]["training_observations"] == 4
+    assert report["symbols"]["BTC/USD"]["withheld_observations"] == 2
+    assert max(inspected) < 4
+    for index in range(4, 6):
+        raw = json.loads(
+            c.execute("SELECT body FROM strategy_observations WHERE id=?", (index,)).fetchone()[0]
+        )
+        raw.update(bid="-1", ask="NaN", rating="INVALID")
+        c.execute("UPDATE strategy_observations SET body=? WHERE id=?", (dumps(raw), index))
+    c.commit()
+    assert entry_research.compare(path, assets) == report
     c.close()

@@ -222,10 +222,12 @@ class AlpacaPaperBroker:
         symbol = normalize_symbol(symbol)
         if symbol not in self.symbols:
             raise BrokerError("Bar request is outside the configured broker universe")
+        if self._bar_provider is not None:
+            if timeframe != "1Min" or type(limit) is not int or not 30 <= limit <= 481:
+                raise BrokerError("Intraday bars require Coinbase timeframe 1Min and limit in [30, 481]")
+            return self._bar_provider.get_bars(symbol, timeframe=timeframe, limit=limit)
         if timeframe != "1Min" or type(limit) is not int or not 30 <= limit <= 240:
             raise BrokerError("Intraday bars require timeframe 1Min and limit in [30, 240]")
-        if self._bar_provider is not None:
-            return self._bar_provider.get_bars(symbol, timeframe=timeframe, limit=limit)
         # A bounded start protects against a sparse page while ``sort=desc`` keeps
         # the latest observations in the single requested page.
         end = utcnow()

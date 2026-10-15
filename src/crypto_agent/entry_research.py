@@ -12,19 +12,29 @@ from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
-from crypto_agent.data.features import build_intraday_features
+from crypto_agent.data.features import build_hourly_features, build_intraday_features
 from crypto_agent.evaluation import Observation, replay_policy
 from crypto_agent.models import AgentError, AssetRules, MarketSnapshot, PriceBar, decimal, dumps, timestamp
+from crypto_agent.risk.intraday import entry_move_proxy_bps
 
 COHORT_VERSIONS = {
     "intraday-ai-1min-v3-capped-probe",
     "intraday-ai-1min-v5.1-low-turnover-paper",
     "intraday-ai-1min-v5.2-economic-low-turnover-paper",
+    "intraday-ai-1min-v5.3-1h6h-low-turnover-paper",
 }
 VARIANTS = (
     "incumbent",
     "entry_score_3",
     "aligned_short_trend",
+    "cost_cover",
+    "cooldown30",
+    "cost_cover_cooldown30",
+)
+HOURLY_VARIANTS = (
+    "incumbent",
+    "entry_score_3",
+    "aligned_hourly_trend",
     "cost_cover",
     "cooldown30",
     "cost_cover_cooldown30",
@@ -45,7 +55,7 @@ def _replay_cadence(config):
     return interval, interval * symbols_per_cycle
 
 
-def _cost_cover(observation, features, risk):
+def _cost_cover(observation, features, risk, strategy):
     if risk is None:
         raise AgentError("Entry research cost_cover requires risk buffers")
     bid, ask = decimal(observation.bid), decimal(observation.ask)
@@ -53,20 +63,15 @@ def _cost_cover(observation, features, risk):
         raise AgentError("Entry research requires a valid saved quote")
     spread_bps = (ask - bid) / ((ask + bid) / 2) * Decimal(10000)
     cost_bps = spread_bps + 2 * (decimal(risk["fee_buffer_bps"]) + decimal(risk["slippage_bps"]))
-    gross_move_bps = max(
-        Decimal(0),
-        features.return_3m_bps,
-        features.return_10m_bps,
-        features.return_30m_bps,
-    )
+    gross_move_bps = entry_move_proxy_bps(features, strategy or {})
     return gross_move_bps >= cost_bps
 
 
 def filtered_observation(
-    observation, features, variant, *, risk=None, last_entry_at=None, cooldown_seconds=1800
+    observation, features, variant, *, risk=None, strategy=None, last_entry_at=None, cooldown_seconds=1800
 ):
     """Only suppress existing Buy/Overweight signals; never invent a trade."""
-    if variant not in VARIANTS:
+    if variant not in VARIANTS and variant not in HOURLY_VARIANTS:
         raise AgentError("Unknown research entry filter")
     if variant == "incumbent" or observation.rating not in {"Buy", "Overweight"}:
         return observation
@@ -81,8 +86,14 @@ def filtered_observation(
             and features.return_10m_bps >= Decimal(3)
             and features.ema_5_vs_20_bps >= Decimal("1.5")
         )
+    elif variant == "aligned_hourly_trend":
+        passes = (
+            features.return_60m_bps >= Decimal(2)
+            and features.return_180m_bps >= Decimal(3)
+            and features.ema_60_vs_180_bps >= Decimal("1.5")
+        )
     elif variant in {"cost_cover", "cost_cover_cooldown30"}:
-        passes = _cost_cover(observation, features, risk)
+        passes = _cost_cover(observation, features, risk, strategy)
     if passes and variant in {"cooldown30", "cost_cover_cooldown30"} and last_entry_at is not None:
         passes = (observation.available_at - last_entry_at).total_seconds() >= cooldown_seconds
     return observation if passes else replace(observation, rating="REVIEW", actionable=False)
@@ -118,15 +129,51 @@ def _features(row, strategy):
         for bar in json.loads(row["bars"])
     )
     decision = json.loads(row["decision"])
-    return build_intraday_features(
+    builder = (
+        build_hourly_features
+        if strategy.get("decision_profile") == "intraday_1to6h"
+        else build_intraday_features
+    )
+    return builder(
         market,
         bars,
         lookback_bars=strategy["intraday_lookback_bars"],
         min_bars=strategy["intraday_min_bars"],
         max_age_seconds=strategy["intraday_max_bar_age_seconds"],
         momentum_threshold_bps=Decimal(strategy["intraday_momentum_threshold_bps"]),
+        expected_source="coinbase-exchange-1min-bars"
+        if strategy.get("intraday_bar_source") == "coinbase_exchange"
+        else None,
+        max_quote_bar_deviation_bps=strategy.get("intraday_max_quote_bar_deviation_bps"),
         now=timestamp(decision["created_at"]),
     )
+
+
+def _variants_for_strategy(strategy):
+    if strategy.get("decision_profile") == "intraday_1to6h":
+        if (
+            strategy.get("intraday_bar_source") != "coinbase_exchange"
+            or strategy.get("intraday_max_quote_bar_deviation_bps") != 100
+        ):
+            raise AgentError(
+                "Hour-profile research requires Coinbase 1-minute bars and 100bps cross-venue bound"
+            )
+        return HOURLY_VARIANTS, {
+            "incumbent": "Recorded AI ratings unchanged",
+            "entry_score_3": "Suppress recorded entries with momentum score below 3",
+            "aligned_hourly_trend": "Suppress entries unless 60m >=2bps, 180m >=3bps and EMA60/180 >=1.5bps",
+            "cost_cover": "Suppress entries whose saved quote spread, fee and slippage buffers exceed the original hour move proxy",
+            "cooldown30": "Suppress entries less than 30 minutes after a prior retained training entry",
+            "cost_cover_cooldown30": "Apply both training-only cost_cover and cooldown30 filters",
+        }
+    return VARIANTS, {
+        "incumbent": "Recorded AI ratings unchanged",
+        "entry_score_3": "Suppress recorded entries with momentum score below 3",
+        "aligned_short_trend": "Suppress entries unless 3m >=2bps, 10m >=3bps and EMA5/20 >=1.5bps",
+        "cost_cover": "Suppress entries whose saved quote spread, fee and slippage buffers exceed the original move proxy",
+        "cooldown30": "Suppress entries less than 30 minutes after a prior retained training entry",
+        "cost_cover_cooldown30": "Apply both training-only cost_cover and cooldown30 filters",
+    }
 
 
 def compare(snapshot: Path, asset_file: Path):
@@ -168,6 +215,7 @@ def compare(snapshot: Path, asset_file: Path):
         config = json.loads(eligible[-1]["config_json"])
         min_interval_seconds, max_gap_seconds = _replay_cadence(config)
         strategy = config["strategy"]
+        variants, variant_descriptions = _variants_for_strategy(strategy)
         if any(
             json.loads(row["body"]).get("model") != "openai:" + strategy["quick_think_llm"]
             for row in eligible
@@ -178,14 +226,7 @@ def compare(snapshot: Path, asset_file: Path):
             "deployment_recommended": False,
             "holdout_evaluated": False,
             "notice": "Exploratory training-only replay of saved Paper observations; not actual fills or proof of profitability. Each contiguous segment starts flat. Repeated training comparisons cannot establish independent validation.",
-            "variants": {
-                "incumbent": "Recorded AI ratings unchanged",
-                "entry_score_3": "Suppress recorded entries with momentum score below 3",
-                "aligned_short_trend": "Suppress entries unless 3m >=2bps, 10m >=3bps and EMA5/20 >=1.5bps",
-                "cost_cover": "Suppress entries whose saved quote spread, fee and slippage buffers exceed the original move proxy",
-                "cooldown30": "Suppress entries less than 30 minutes after a prior retained training entry",
-                "cost_cover_cooldown30": "Apply both training-only cost_cover and cooldown30 filters",
-            },
+            "variants": variant_descriptions,
             "config_digest": cohort_digest,
             "effective_run_config_digest": eligible[-1]["config_digest"],
             "replay_min_interval_seconds": min_interval_seconds,
@@ -241,7 +282,7 @@ def compare(snapshot: Path, asset_file: Path):
                 }
             )
             comparisons = {}
-            for variant in VARIANTS:
+            for variant in variants:
                 replays = []
                 suppressed = 0
                 for part in segments:
@@ -253,6 +294,7 @@ def compare(snapshot: Path, asset_file: Path):
                             features,
                             variant,
                             risk=config["risk"],
+                            strategy=strategy,
                             last_entry_at=last_entry_at,
                         )
                         filtered.append(current)

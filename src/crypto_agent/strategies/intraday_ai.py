@@ -10,7 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from crypto_agent.config import validate_intraday_entry_economics, validate_intraday_policy
-from crypto_agent.data.features import IntradayFeatures, build_intraday_features
+from crypto_agent.data.features import IntradayFeatures, build_hourly_features, build_intraday_features
 from crypto_agent.models import (
     AgentError,
     MarketSnapshot,
@@ -23,12 +23,20 @@ from crypto_agent.models import (
     timestamp,
     utcnow,
 )
-from crypto_agent.risk.intraday import probe_position_cap, round_trip_cost_bps
+from crypto_agent.risk.intraday import entry_move_proxy_bps, probe_position_cap, round_trip_cost_bps
 
 RATINGS = frozenset({"Buy", "Overweight", "Hold", "Underweight", "Sell"})
 OUTPUT_RATINGS = RATINGS | {"REVIEW"}
 _OUTPUT_FIELDS = {"rating", "summary", "evidence"}
 _RUNTIME_ENV = {"PATH", "HOME", "LANG", "LC_ALL", "SYSTEMROOT", "SSL_CERT_FILE", "SSL_CERT_DIR"}
+_HOUR_PROFILE = "intraday_1to6h"
+
+
+def _feature_text(features, *names):
+    for name in names:
+        if hasattr(features, name):
+            return getattr(features, name)
+    return None
 
 
 class IntradayAIStrategy:
@@ -45,8 +53,13 @@ class IntradayAIStrategy:
             self.version = "intraday-ai-1min-v5.1-low-turnover-paper"
         if config.get("intraday_require_cost_cover", False) is True:
             self.version = "intraday-ai-1min-v5.2-economic-low-turnover-paper"
-        if config.get("asset_type") != "crypto" or config.get("decision_profile") != "intraday_10m":
-            raise AgentError("Intraday AI requires crypto mode and intraday_10m profile")
+        if config.get("decision_profile") == _HOUR_PROFILE:
+            self.version = "intraday-ai-1min-v5.3-1h6h-low-turnover-paper"
+        if config.get("asset_type") != "crypto" or config.get("decision_profile") not in {
+            "intraday_10m",
+            _HOUR_PROFILE,
+        }:
+            raise AgentError("Intraday AI requires crypto mode and an intraday decision profile")
         if config.get("llm_provider") != "openai" or not config.get("quick_think_llm"):
             raise AgentError("Intraday AI currently requires an OpenAI-compatible model")
         for name in (
@@ -59,7 +72,10 @@ class IntradayAIStrategy:
         ):
             if type(config.get(name)) is not int:
                 raise AgentError(f"Invalid intraday integer setting: {name}")
-        if not 31 <= config["intraday_min_bars"] <= config["intraday_lookback_bars"] <= 240:
+        if config.get("decision_profile") == _HOUR_PROFILE:
+            if not 361 <= config["intraday_min_bars"] <= config["intraday_lookback_bars"] <= 480:
+                raise AgentError("Invalid intraday hour lookback/minimum bar count")
+        elif not 31 <= config["intraday_min_bars"] <= config["intraday_lookback_bars"] <= 240:
             raise AgentError("Invalid intraday lookback/minimum bar count")
         if not 1 <= config["intraday_max_bar_age_seconds"] <= 600:
             raise AgentError("Invalid intraday bar freshness limit")
@@ -67,6 +83,18 @@ class IntradayAIStrategy:
             raise AgentError("Intraday entry score must be in [1, 4]")
         self.entry_policy = validate_intraday_policy(config)
         self.require_entry_cost_cover = validate_intraday_entry_economics(config)
+        if config.get("decision_profile") == _HOUR_PROFILE and (
+            self.require_entry_cost_cover is not True
+            or config.get("intraday_probe_profile") != "expanded_paper"
+            or self.entry_policy != "capped_probe"
+            or config.get("intraday_trade_filter") != "confirm2_cooldown30"
+            or config.get("intraday_bar_source") != "coinbase_exchange"
+            or config.get("intraday_max_quote_bar_deviation_bps") != 100
+            or config.get("intraday_max_bar_age_seconds") != 180
+        ):
+            raise AgentError(
+                "intraday_1to6h requires expanded Paper capped_probe cost-cover Coinbase configuration"
+            )
         self.momentum_threshold = decimal(
             config.get("intraday_momentum_threshold_bps"), "intraday momentum threshold"
         )
@@ -96,12 +124,7 @@ class IntradayAIStrategy:
 
     def _entry_costs(self, market: MarketSnapshot, features: IntradayFeatures) -> tuple[Decimal, Decimal]:
         cost_bps = round_trip_cost_bps(market, self.risk)
-        gross_move_bps = max(
-            Decimal(0),
-            features.return_3m_bps,
-            features.return_10m_bps,
-            features.return_30m_bps,
-        )
+        gross_move_bps = entry_move_proxy_bps(features, self.config)
         return gross_move_bps, cost_bps
 
     @property
@@ -110,6 +133,10 @@ class IntradayAIStrategy:
             "timeframe": "1Min",
             "limit": self.config["intraday_lookback_bars"] + 1,
         }
+
+    @property
+    def horizon_minutes(self) -> str:
+        return "60-360" if self.config.get("decision_profile") == _HOUR_PROFILE else "10-180"
 
     def _decision(
         self,
@@ -140,7 +167,12 @@ class IntradayAIStrategy:
     def _features(
         self, market: MarketSnapshot, bars: tuple[PriceBar, ...], *, now: datetime | None = None
     ) -> IntradayFeatures:
-        return build_intraday_features(
+        builder = (
+            build_hourly_features
+            if self.config.get("decision_profile") == _HOUR_PROFILE
+            else build_intraday_features
+        )
+        return builder(
             market,
             bars,
             lookback_bars=self.config["intraday_lookback_bars"],
@@ -209,7 +241,16 @@ class IntradayAIStrategy:
                     evidence=(f"Momentum score {features.momentum_score}; required {minimum_score}",),
                     evaluation_eligible=True,
                 )
-            gross_move_bps, round_trip_cost_bps = self._entry_costs(market, features)
+            try:
+                gross_move_bps, round_trip_cost_bps = self._entry_costs(market, features)
+            except AgentError as exc:
+                return self._decision(
+                    started_at,
+                    market.symbol,
+                    str(exc),
+                    evidence=tuple(item.strip() for item in evidence),
+                    evaluation_eligible=True,
+                )
             if (
                 (self.entry_policy == "cost_cover" or self.require_entry_cost_cover)
                 and target > current
@@ -246,12 +287,34 @@ class IntradayAIStrategy:
                     evidence=(f"Momentum score {features.momentum_score}; required at most {maximum_score}",),
                     evaluation_eligible=True,
                 )
-        gross_move_bps, round_trip_cost_bps = self._entry_costs(market, features)
+        try:
+            gross_move_bps, round_trip_cost_bps = self._entry_costs(market, features)
+        except AgentError as exc:
+            return self._decision(
+                started_at,
+                market.symbol,
+                str(exc),
+                evidence=tuple(item.strip() for item in evidence),
+                evaluation_eligible=True,
+            )
+        if self.config.get("decision_profile") == _HOUR_PROFILE:
+            return_line = (
+                f"Returns bps 1h={_feature_text(features, 'return_1h_bps', 'return_60m_bps')}, "
+                f"3h={_feature_text(features, 'return_3h_bps', 'return_180m_bps')}, "
+                f"6h={_feature_text(features, 'return_6h_bps', 'return_360m_bps')}; "
+                f"EMA60/180={_feature_text(features, 'ema_60_vs_180_bps', 'hourly_ema_60_vs_180_bps')}; "
+                f"score={features.momentum_score}"
+            )
+        else:
+            return_line = (
+                f"Returns bps 3m={features.return_3m_bps}, 10m={features.return_10m_bps}, "
+                f"30m={features.return_30m_bps}; EMA5/20={features.ema_5_vs_20_bps}; "
+                f"score={features.momentum_score}"
+            )
         feature_evidence = (
             f"Analysis candle source {features.source}; execution quote source {market.source}",
             f"Closed 1-minute bars {features.bar_count}, last start {features.last_bar_at.isoformat()}",
-            f"Returns bps 3m={features.return_3m_bps}, 10m={features.return_10m_bps}, "
-            f"30m={features.return_30m_bps}; EMA5/20={features.ema_5_vs_20_bps}; score={features.momentum_score}",
+            return_line,
             f"Quote {market.price} at {market.observed_at.isoformat()}; current allocation {current}; target {target}",
             f"Gross directional move proxy {gross_move_bps} bps; configured round-trip cost "
             f"{round_trip_cost_bps} bps",
@@ -319,10 +382,12 @@ class IntradayAIStrategy:
                     "rating_targets": self.targets,
                     "long_only": True,
                     "leverage": False,
-                    "horizon_minutes": "10-180",
+                    "horizon_minutes": self.horizon_minutes,
                 },
             },
         }
+        if "reasoning_effort" in self.config:
+            payload["reasoning_effort"] = self.config["reasoning_effort"]
         env = {key: value for key, value in os.environ.items() if key in _RUNTIME_ENV}
         if os.environ.get("OPENAI_API_KEY"):
             env["OPENAI_API_KEY"] = os.environ["OPENAI_API_KEY"]

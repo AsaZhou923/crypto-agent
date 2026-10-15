@@ -294,7 +294,7 @@ def run_once(
                 result = validate_intraday_order(
                     order, fresh_market, fresh_portfolio, settings.strategy, settings.risk
                 )
-            if result.allowed and "intraday_require_cost_cover" in settings.strategy:
+            if result.allowed and settings.strategy.get("intraday_require_cost_cover") is True:
                 context = database.connection.execute(
                     "SELECT body FROM intraday_contexts WHERE run_id=?", (run_id,)
                 ).fetchone()
@@ -374,7 +374,7 @@ def execute_preview(
         )
         if risk.allowed:
             risk = validate_intraday_order(order, market, portfolio, settings.strategy, settings.risk)
-        if risk.allowed and "intraday_require_cost_cover" in settings.strategy:
+        if risk.allowed and settings.strategy.get("intraday_require_cost_cover") is True:
             context = database.connection.execute(
                 "SELECT body FROM intraday_contexts WHERE run_id=?", (run_id,)
             ).fetchone()
@@ -428,7 +428,7 @@ def execute_preview(
             context = database.connection.execute(
                 "SELECT body FROM intraday_contexts WHERE run_id=?", (run_id,)
             ).fetchone()
-            if final_risk.allowed and "intraday_require_cost_cover" in settings.strategy:
+            if final_risk.allowed and settings.strategy.get("intraday_require_cost_cover") is True:
                 final_risk = _validate_entry_economics_from_context(
                     order,
                     market,

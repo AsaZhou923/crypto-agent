@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -22,6 +23,30 @@ from crypto_agent.models import AgentError, timestamp
 
 def client(**kwargs):
     return TestClient(create_app(**kwargs), base_url="http://127.0.0.1")
+
+
+def test_current_holding_horizon_is_explicit_without_exposing_configuration(tmp_path):
+    monitor = Monitor(demo_mode=True, root=tmp_path)
+    monitor.settings = SimpleNamespace(
+        strategy={"decision_profile": "intraday_1to6h", "backend_url": "private-test-url"}
+    )
+    monitor.database = lambda: {
+        "metadata": {},
+        "runs": [],
+        "decisions": [],
+        "orders": [],
+        "risk": [],
+        "snapshots": [],
+        "cycles": [],
+    }
+    value, _, _, _ = monitor.agent()
+    assert value["strategy_profile"] == "intraday_1to6h"
+    assert value["holding_horizon_minutes"] == [60, 360]
+    assert "private-test-url" not in json.dumps(value)
+    monitor.settings.strategy["decision_profile"] = "intraday_10m"
+    assert monitor.agent()[0]["holding_horizon_minutes"] == [10, 180]
+    monitor.settings = None
+    assert "holding_horizon_minutes" not in monitor.agent()[0]
 
 
 def test_demo_consistent_ledger_and_account():

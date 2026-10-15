@@ -3,10 +3,34 @@
 from decimal import Decimal
 
 from crypto_agent.config import validate_intraday_policy
-from crypto_agent.data.features import build_intraday_features
+from crypto_agent.data.features import build_hourly_features, build_intraday_features
 from crypto_agent.models import AgentError, RiskResult, decimal
 
 BPS = Decimal(10000)
+
+
+def _feature_value(features, *names) -> Decimal:
+    for name in names:
+        if hasattr(features, name):
+            return decimal(getattr(features, name), name)
+    raise AgentError("Intraday hour-horizon features are missing")
+
+
+def entry_move_proxy_bps(features, strategy) -> Decimal:
+    """Return the configured gross directional move proxy used by all entry gates."""
+    if strategy.get("decision_profile") == "intraday_1to6h":
+        return max(
+            Decimal(0),
+            _feature_value(features, "return_1h_bps", "return_60m_bps"),
+            _feature_value(features, "return_3h_bps", "return_180m_bps"),
+            _feature_value(features, "return_6h_bps", "return_360m_bps"),
+        )
+    return max(
+        Decimal(0),
+        decimal(features.return_3m_bps),
+        decimal(features.return_10m_bps),
+        decimal(features.return_30m_bps),
+    )
 
 
 def round_trip_cost_bps(market, risk) -> Decimal:
@@ -52,7 +76,12 @@ def validate_entry_economics(order, market, decision, bars, strategy, risk) -> R
     try:
         if decision.rating not in {"Buy", "Overweight"}:
             return RiskResult(True, ())
-        features = build_intraday_features(
+        builder = (
+            build_hourly_features
+            if strategy.get("decision_profile") == "intraday_1to6h"
+            else build_intraday_features
+        )
+        features = builder(
             market,
             tuple(bars),
             lookback_bars=strategy["intraday_lookback_bars"],
@@ -67,12 +96,7 @@ def validate_entry_economics(order, market, decision, bars, strategy, risk) -> R
             else None,
             max_quote_bar_deviation_bps=strategy.get("intraday_max_quote_bar_deviation_bps"),
         )
-        gross_move_bps = max(
-            Decimal(0),
-            features.return_3m_bps,
-            features.return_10m_bps,
-            features.return_30m_bps,
-        )
+        gross_move_bps = entry_move_proxy_bps(features, strategy)
         cost_bps = round_trip_cost_bps(market, risk)
         if gross_move_bps < cost_bps:
             raise AgentError(
